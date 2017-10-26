@@ -182,7 +182,6 @@ echo "# deb-src https://download.ceph.com/debian-jewel/ xenial main" >> /etc/apt
 
 apt-get update
 echo "Removing ceph"
-apt-get remove -y ceph ceph-base ceph-common ceph-mds ceph-mon ceph-osd libcephfs1 python-cephfs python-rados python-rbd radosgw librgw2 librbd1 libradosstriper1 librados2 --purge
 apt-get install -y ceph
 echo "Starting osds"
 systemctl start ceph-osd.target
