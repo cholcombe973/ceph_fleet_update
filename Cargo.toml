@@ -1,0 +1,40 @@
+[package]
+name = "ceph_fleet_update"
+version = "0.1.0"
+authors = ["Chris Holcombe <xfactor973@gmail.com>"]
+
+[dependencies]
+ceph-rust = "~0.1"
+chrono = { version = "~0.4", features = ["rustc-serialize"] }
+debian = {git = "https://github.com/mwanner/rust-debian" }
+error-chain = "0.10.0"
+init-daemon = "*"
+log = {version = "0.3.6", features = ["release_max_level_info"] }
+nix = "~0.9"
+os_type = "1.0.0"
+rand = "~0.3"
+regex = "*"
+tarpc = "0.8.0"
+tarpc-plugins = "0.1.1"
+uuid = { version = "^0.4", features = ["v4"] }
+
+# The development profile, used for `cargo build`
+[profile.dev]
+opt-level = 0  # Controls the --opt-level the compiler builds with
+debug = true   # Controls whether the compiler passes -g or `--cfg ndebug`
+rpath = false  # Controls whether the compiler passes `-C rpath`
+lto = false    # Controls `-C lto` for binaries and staticlibs
+debug-assertions = true  # Controls whether debug assertions are enabled
+
+# The release profile, used for `cargo build --release`
+[profile.release]
+opt-level = 3
+debug = false
+rpath = false
+lto = false
+debug-assertions = false
+
+
+[[bin]]
+name = "main"
+path = "src/main.rs"
