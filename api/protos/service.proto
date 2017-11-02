@@ -1,0 +1,26 @@
+syntax = "proto2";
+option optimize_for = SPEED;
+
+package ceph_fleet_update;
+
+message OpResult {
+  required ResultType result = 1;
+  optional string error_msg = 2;
+}
+
+enum ResultType{
+  OK = 0;
+  ERR = 1;
+}
+
+enum Op {
+  // What version are you currently running
+  Version = 3;
+  // Start upgrading yourself
+  Upgrade = 4;
+}
+
+// Service operations that can be performed
+message Operation {
+  required Op Op_type = 1;
+}

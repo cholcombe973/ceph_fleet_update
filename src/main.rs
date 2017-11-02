@@ -1,42 +1,23 @@
-#![feature(plugin, use_extern_macros)]
-#![plugin(tarpc_plugins)]
 extern crate debian;
 #[macro_use]
 extern crate log;
 extern crate os_type;
-#[macro_use]
-extern crate tarpc;
 extern crate uuid;
 
 mod apt;
-//mod errors;
 mod ceph_upgrade;
 
 use std::net::IpAddr;
 use std::process::Command;
-use std::sync::mpsc;
-use std::thread;
 
 use debian::version::Version;
-//use errors::*;
-use tarpc::sync::{client, server};
-use tarpc::sync::client::ClientExt;
-use tarpc::util::{FirstSocketAddr, Never};
 use uuid::Uuid;
 
 /*
     TODO: 1. slack integration
           2. use as a library
           3. Email notifications
- */
-
-service! {
-    rpc node_upgrade(new_version: String);
-    rpc mon_upgrade(new_version: String);
-    rpc osd_upgrade(new_version: String);
-    rpc mds_upgrade(new_version: String);
-    rpc rgw_upgrade(new_version: String);
-}
+*/
 
 pub trait Upgrade {
     /// Implement everything in this function to upgrade a node to a new version
@@ -47,8 +28,14 @@ pub trait Upgrade {
     fn upgrade_rgw(&self, new_version: String) -> Result<(), String>;
 }
 
+// Upload this binary to all hosts on a host:port combo and launch it
+fn upload_and_execute(hosts: Vec<(String, u16)>, listen_port: u16) -> Result<(), String> {
+    Ok(())
+}
+
 fn main() {
     let v = Version::parse("1:21.7-3").unwrap();
+    ceph_upgrade::discover_topology();
     ceph_upgrade::roll_cluster(&v);
 }
 
@@ -81,6 +68,7 @@ impl UpdatePackage for CentosPackage {
     }
 }
 
+/*
 impl UpdatePackage for UbuntuPackage {
     /// Add keys for the repo
     fn install_keys() {}
@@ -97,6 +85,7 @@ impl UpdatePackage for UbuntuPackage {
         Ok(())
     }
 }
+*/
 
 /*
 # Edge cases:

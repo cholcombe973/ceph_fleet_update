@@ -18,63 +18,72 @@ use std::str::FromStr;
 use std::thread;
 use std::time::SystemTime;
 
-use SyncService;
-
-use self::ceph_rust::ceph::ceph_version;
+use self::ceph_rust::ceph::{connect_to_ceph, ceph_version, disconnect_from_ceph};
+use self::ceph_rust::cmd::{mon_dump, osd_tree};
+use self::ceph_rust::error::RadosResult;
 use self::chrono::*;
 use self::init_daemon::{detect_daemon, Daemon};
 use self::nix::unistd::chown;
 use self::rand::distributions::{IndependentSample, Range};
 use self::regex::Regex;
-use self::semver::Version;
+use self::semver::Version as SemVer;
 use self::uuid::Uuid;
 
 use super::apt;
 use super::debian::version::Version;
 use super::os_type;
-use super::tarpc::util::Never;
 use super::Upgrade;
 
 
-fn backup_conf_files() -> IOResult<Vec<PathBuf>>{
+fn backup_conf_files() -> IOResult<Vec<PathBuf>> {
     debug!("Backing up /etc/ceph config files to /tmp");
-    let mut backed_up  = Vec::new();
+    let mut backed_up = Vec::new();
     for entry in read_dir("/etc/ceph")? {
         let entry = entry?;
         let path = entry.path();
         // Should only be conf files in here
         if !path.is_dir() {
             // cp /etc/ceph/ceph.conf /tmp/ceph.conf
-            copy(path, format!("/tmp/{}", path.display())?;
+            copy(path, format!("/tmp/{}", path.display()))?;
         }
     }
     Ok(backed_up)
 }
 
-fn restore_conf_files(files: &Vec<PathBuf>) -> IOResult<()>{
+fn restore_conf_files(files: &Vec<PathBuf>) -> IOResult<()> {
     debug!("Restoring config files to /etc/ceph");
-    for f in files{
-        copy(f, format!("/etc/ceph/{}", f.display())?;
+    for f in files {
+        copy(f, format!("/etc/ceph/{}", f.display()))?;
     }
+    Ok(())
 }
 
-fn get_gpg_key()->IOResult<()>{
-
+// Get the GPG key for the ceph repo
+fn get_gpg_key() -> IOResult<()> {
+    Ok(())
 }
 
-fn create_apt_proxy(http_endpoint: &str, https_endpoint: &str) -> IOResult<usize>{
+// Create the apt proxy file so that apt can reach the ceph upstream repo from behind
+// a firewall
+fn create_apt_proxy(http_endpoint: &str, https_endpoint: &str) -> IOResult<usize> {
     debug!("Ensuring apt proxy exists");
     let mut bytes_written = 0;
     let mut f = File::create("/etc/apt/apt.conf.d/60proxy")?;
-    bytes_written += f.write(&format!("Acquire::http::Proxy \"{}\";", http_endpoint);
-    bytes_written += f.write(&format!("Acquire::https::Proxy \"{}\";", https_endpoint);
+    bytes_written += f.write(
+        format!("Acquire::http::Proxy \"{}\";", http_endpoint)
+            .as_bytes(),
+    )?;
+    bytes_written += f.write(
+        format!("Acquire::https::Proxy \"{}\";", https_endpoint)
+            .as_bytes(),
+    )?;
 
     Ok(bytes_written)
 }
 
 enum CephType {
-    Mon { id: String },
-    Osd { num: u64 },
+    Mon { id: String, rank: u8 },
+    Osd,
     Mds { id: String },
     Rgw { id: String },
 }
@@ -101,31 +110,37 @@ struct CephNode {
     pub os_information: os_type::OSInformation,
 }
 
-impl SyncService for CephServer {
-    fn node_upgrade(&self, version: String) -> Result<(), Never> {
-        let c = CephNode { os_information: os_type::current_platform() };
-        return c.upgrade_node(version);
-    }
-    fn mon_upgrade(&self, version: String) -> Result<(), Never> {
-        let c = CephNode { os_information: os_type::current_platform() };
-        return Ok(());
-    }
-    fn osd_upgrade(&self, version: String) -> Result<(), Never> {
-        let c = CephNode { os_information: os_type::current_platform() };
-        return Ok(());
-    }
-    fn mds_upgrade(&self, version: String) -> Result<(), Never> {
-        return Ok(());
-    }
-    fn rgw_upgrade(&self, version: String) -> Result<(), Never> {
-        return Ok(());
-    }
-}
-
 // TODO Ensure that the /etc/apt/apt.conf.d/60proxy is in place
 fn ensure_proxy() {
     //
 
+}
+
+pub fn discover_topology() -> RadosResult<Vec<(CephServer, CephType)>> {
+    let mut cluster: Vec<(CephServer, CephType)> = Vec::new();
+    let handle = connect_to_ceph("admin", "/etc/ceph/ceph.conf")?;
+
+    let mon_info = mon_dump(handle)?;
+    for mon in mon_info.mons {
+        cluster.push((
+            CephServer {
+                ip_addr: IpAddr::from_str(mon.addr.split(""))?,
+            },
+            CephType::Mon {
+                id: mon.name,
+                rank: 0,
+            },
+        ));
+    }
+    let osd_info = osd_tree(handle)?;
+    for osd in osd_info.nodes {
+        cluster.push((
+            CephServer { ip_addr: IpAddr::from_str("")? },
+            CephType::Osd,
+        ))
+    }
+    disconnect_from_ceph(handle);
+    Ok(cluster)
 }
 
 ///Main function to call which implements the upgrade logic
@@ -171,7 +186,7 @@ impl Upgrade for CephNode {
     }
     // Any OSD specific upgrade instructions need to go here
     fn upgrade_osd(&self, version: String) -> Result<(), String> {
-/*
+        /*
 echo "Stopping osds"
 systemctl stop ceph-osd.target
 wget -q -O- 'https://download.ceph.com/keys/release.asc' | sudo apt-key add -
@@ -198,11 +213,23 @@ systemctl start ceph-osd.target
         self.stop_osd(0);
         //backup ceph conf files
         // Check if these packages exist and remove all
-        apt::apt_remove(vec!["ceph", "ceph-base", "ceph-common", 
-            "ceph-mds", "ceph-mon", "ceph-osd", "libcephfs1" 
-            "python-cephfs", "python-rados", "python-rbd", 
-            "radosgw", "librgw2" "librbd1", "libradosstriper1", 
-            "librados2"])?;
+        apt::apt_remove(vec![
+            "ceph",
+            "ceph-base",
+            "ceph-common",
+            "ceph-mds",
+            "ceph-mon",
+            "ceph-osd",
+            "libcephfs1",
+            "python-cephfs",
+            "python-rados",
+            "python-rbd",
+            "radosgw",
+            "librgw2",
+            "librbd1",
+            "libradosstriper1",
+            "librados2",
+        ])?;
         self.disable_osd(0);
         //
         apt::apt_install(vec!["ceph"])?;
@@ -355,12 +382,10 @@ impl CephNode {
             if file_name.starts_with("ceph-mon") {
                 ceph_processes.push(CephType::Mon {
                     id: file_name.trim_left_matches("ceph-mon.").into(),
+                    rank: 0,
                 });
             } else if file_name.starts_with("ceph-osd") {
-                ceph_processes.push(CephType::Osd {
-                    num: u64::from_str(file_name.trim_left_matches("ceph-osd."))
-                        .map_err(|e| e.to_string())?,
-                });
+                ceph_processes.push(CephType::Osd);
             } else if file_name.starts_with("ceph-mds") {
                 ceph_processes.push(CephType::Mds {
                     id: file_name.trim_left_matches("ceph-mds.").into(),
@@ -375,40 +400,48 @@ impl CephNode {
     }
 }
 
-fn ceph_user(c: CephType) -> Result<String, String> {
-    let socket = match c {
-        CephType::Mds => "",
-        CephType::Mon => "",
-        CephType::Osd => "",
-        CephType::Rgw => "",
-    };
-    let v = match ceph_version(format!("/var/run/ceph/{}", socket)) {
+fn ceph_release(socket: &str) -> Option<CephVersion> {
+    let v = match ceph_version(&format!("/var/run/ceph/{}", socket)) {
         Some(v) => v,
         None => {
-            return Err(
-                "Unable to discover ceph version.  Can't discern correct user",
-            )
+            error!("Unable to discover ceph version.  Can't discern correct user");
+            return None;
         }
     };
-    let ceph_version = Version::parse(v).unwrap();
+    let ceph_version = match SemVer::parse(&v) {
+        Ok(v) => v,
+        Err(e) => {
+            error!("Semver failed to parse ceph version: {}", &v);
+            return None;
+        }
+    };
     match ceph_version.major {
-        //
         0 => {
             match ceph_version.minor {
-                67 => CephVersion::Dumpling,
-                72 => CephVersion::Emperor,
-                80 => CephVersion::Firefly,
-                87 => CephVersion::Giant,
-                94 => CephVersion::Hammer,
+                67 => Some(CephVersion::Dumpling),
+                72 => Some(CephVersion::Emperor),
+                80 => Some(CephVersion::Firefly),
+                87 => Some(CephVersion::Giant),
+                94 => Some(CephVersion::Hammer),
                 _ => None,
             }
         }
-        9 => CephVersion::Infernalis,
-        10 => CephVersion::Jewel,
-        11 => CephVersion::Kraken,
-        12 => CephVersion::Luminous,
+        9 => Some(CephVersion::Infernalis),
+        10 => Some(CephVersion::Jewel),
+        11 => Some(CephVersion::Kraken),
+        12 => Some(CephVersion::Luminous),
         _ => None,
+    }
+}
+
+fn ceph_user(c: CephType) -> Result<String, String> {
+    let socket = match c {
+        CephType::Mds { ref id } => "",
+        CephType::Mon { ref id, ref rank } => "",
+        CephType::Osd => "",
+        CephType::Rgw { ref id } => "",
     };
+    let release = ceph_release("");
     Ok("ceph".into())
 }
 
@@ -418,7 +451,10 @@ fn ceph_user(c: CephType) -> Result<String, String> {
 ///so this method will issue a set_status for any changes of ownership which
 ///recurses into directory structures.
 fn update_owner(path: &Path, recurse_dirs: bool) -> ::std::io::Result<()> {
-    let user = ceph_user().unwrap();
+    let user = ceph_user(CephType::Mon {
+        id: "".into(),
+        rank: 0,
+    }).unwrap();
     let user_group = format!("{ceph_user}:{ceph_user}", ceph_user = user);
     let mut cmd: Vec<String> = vec![
         "chown".into(),
