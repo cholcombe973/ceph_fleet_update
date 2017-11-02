@@ -6,6 +6,7 @@ authors = ["Chris Holcombe <xfactor973@gmail.com>"]
 [dependencies]
 api = { path = "api" }
 ceph-rust = {path = "/home/chris/repos/ceph-rust" } #"~0.1"
+clap = "*"
 chrono = { version = "~0.4", features = ["rustc-serialize"] }
 debian = {git = "https://github.com/mwanner/rust-debian" }
 error-chain = "0.10.0"
@@ -13,6 +14,7 @@ init-daemon = "*"
 log = {version = "0.3.6", features = ["release_max_level_info"] }
 nix = "~0.9"
 os_type = "1.0.0"
+protobuf = "*"
 rand = "~0.3"
 regex = "*"
 reqwest = "~0.8"
@@ -20,6 +22,7 @@ semver = "*"
 simplelog = "*"
 slack-hook = "*"
 uuid = { version = "^0.4", features = ["v4"] }
+zmq = "*"
 
 # The development profile, used for `cargo build`
 [profile.dev]

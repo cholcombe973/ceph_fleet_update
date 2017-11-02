@@ -1,5 +1,10 @@
 extern crate init_daemon;
+extern crate reqwest;
 
+use std::fs::File;
+use std::io::{Error, ErrorKind, Read, Write};
+use std::io::Result as IOResult;
+use std::path::Path;
 use std::process::Command;
 
 use self::init_daemon::{detect_daemon, Daemon};
@@ -62,6 +67,47 @@ pub fn apt_remove(packages: Vec<&str>) -> Result<(), String> {
     }
     return Ok(());
 
+}
+
+/// Create the apt proxy file so that apt can reach the ceph upstream repo from behind
+/// a firewall
+fn create_apt_proxy(http_endpoint: &str, https_endpoint: &str) -> IOResult<usize> {
+    debug!("Ensuring apt proxy exists");
+    let mut bytes_written = 0;
+    let mut f = File::create("/etc/apt/apt.conf.d/60proxy")?;
+    bytes_written += f.write(
+        format!("Acquire::http::Proxy \"{}\";", http_endpoint)
+            .as_bytes(),
+    )?;
+    bytes_written += f.write(
+        format!("Acquire::https::Proxy \"{}\";", https_endpoint)
+            .as_bytes(),
+    )?;
+
+    Ok(bytes_written)
+}
+
+/// Ensure that the /etc/apt/apt.conf.d/60proxy is in place with the proper
+/// endpoints
+pub fn ensure_proxy(http_endpoint: &str, https_endpoint: &str) {
+    if !Path::new("/etc/apt/apt.conf.d/60proxy").exists() {
+        create_apt_proxy(http_endpoint, https_endpoint);
+    }
+}
+
+// Get the GPG key for the ceph repo
+pub fn get_gpg_key(l: &str) -> IOResult<String> {
+    let mut resp = reqwest::get(l).map_err(|e| Error::new(ErrorKind::Other, e))?;
+    if resp.status().is_success() {
+        let mut content = String::new();
+        resp.read_to_string(&mut content);
+        return Ok(content);
+    } else {
+        return Err(Error::new(
+            ErrorKind::Other,
+            format!("Unable to download gpg key: {}", resp.status()),
+        ));
+    }
 }
 
 pub fn service_stop(name: &str) -> Result<(), String> {

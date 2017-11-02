@@ -3,6 +3,13 @@ option optimize_for = SPEED;
 
 package ceph_fleet_update;
 
+// Result that returns a string
+message StringResult {
+  required ResultType result = 1;
+  optional string output = 2;
+  optional string error_msg = 3;
+}
+
 message OpResult {
   required ResultType result = 1;
   optional string error_msg = 2;
@@ -15,12 +22,15 @@ enum ResultType{
 
 enum Op {
   // What version are you currently running
-  Version = 3;
+  Version = 1;
   // Start upgrading yourself
-  Upgrade = 4;
+  Upgrade = 2;
+  Stop = 3;
 }
 
 // Service operations that can be performed
 message Operation {
   required Op Op_type = 1;
+  // Version to upgrade to
+  optional string version = 2;
 }

@@ -1,42 +1,263 @@
+extern crate api;
+#[macro_use]
+extern crate clap;
 extern crate debian;
 #[macro_use]
 extern crate log;
 extern crate os_type;
+extern crate protobuf;
+extern crate simplelog;
 extern crate uuid;
+extern crate zmq;
 
 mod apt;
 mod ceph_upgrade;
 
-use std::net::IpAddr;
+use std::fs::File;
+use std::io::{Error, ErrorKind};
+use std::io::Result as IOResult;
 use std::process::Command;
+use std::thread;
+use std::time::Duration;
 
+use api::service::{Op, Operation, ResultType, OpResult, StringResult};
+use clap::{Arg, App};
 use debian::version::Version;
-use uuid::Uuid;
+use protobuf::Message as ProtobufMsg;
+use protobuf::core::parse_from_bytes;
+use simplelog::{Config, CombinedLogger, TermLogger, WriteLogger};
+use zmq::{Message, Socket};
+use zmq::Result as ZmqResult;
 
 /*
     TODO: 1. slack integration
           2. use as a library
           3. Email notifications
 */
+fn listen(port: &str) -> ZmqResult<()> {
+    debug!("Starting zmq listener with version({:?})", zmq::version());
+    let context = zmq::Context::new();
+    let mut responder = context.socket(zmq::REP)?;
 
-pub trait Upgrade {
-    /// Implement everything in this function to upgrade a node to a new version
-    fn upgrade_node(&self, new_version: String) -> Result<(), String>;
-    fn upgrade_mon(&self, new_version: String) -> Result<(), String>;
-    fn upgrade_osd(&self, new_version: String) -> Result<(), String>;
-    fn upgrade_mds(&self, new_version: String) -> Result<(), String>;
-    fn upgrade_rgw(&self, new_version: String) -> Result<(), String>;
+    debug!("Listening on tcp://*:{}", port);
+    assert!(responder.bind(&format!("tcp://*:{}", port)).is_ok());
+
+    loop {
+        let msg = responder.recv_bytes(0)?;
+        debug!("Got msg len: {}", msg.len());
+        trace!("Parsing msg {:?} as hex", msg);
+        let operation = match parse_from_bytes::<api::service::Operation>(&msg) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                error!("Failed to parse_from_bytes {:?}.  Ignoring request", e);
+                continue;
+            }
+        };
+
+        debug!("Operation requested: {:?}", operation.get_Op_type());
+        match operation.get_Op_type() {
+            Op::Version => {
+                // Get the ceph verstion running and also the dpkg installed version
+                match handle_get_version(&mut responder) {
+                    Ok(_) => {
+                        info!("Get version successful");
+                    }
+                    Err(e) => {
+                        error!("Get version error: {:?}", e);
+                    }
+                };
+            }
+            Op::Upgrade => {
+                if !operation.has_version() {
+                    error!("Upgrade operation must include version field.  Ignoring request");
+                    continue;
+                }
+                let version = operation.get_version();
+                match handle_upgrade(&mut responder, version) {
+                    Ok(_) => {
+                        info!("Upgrade successful");
+                    }
+                    Err(e) => {
+                        error!("Upgrade error: {:?}", e);
+                    }
+                };
+            }
+            Op::Stop => {
+                // Exit
+                info!("Exit called");
+                return Ok(());
+            }
+        };
+        thread::sleep(Duration::from_millis(10));
+    }
 }
+
+fn handle_get_version(s: &mut Socket) -> IOResult<()> {
+    let mut result = StringResult::new();
+    match ceph_upgrade::get_version() {
+        Ok(vers) => {
+            result.set_result(ResultType::OK);
+            result.set_output(vers);
+            let encoded = result.write_to_bytes().map_err(
+                |e| Error::new(ErrorKind::Other, e),
+            )?;
+            let msg = Message::from_slice(&encoded)?;
+            debug!("Responding to client with msg len: {}", msg.len());
+            s.send_msg(msg, 0)?;
+        }
+        Err(e) => {
+            result.set_result(ResultType::ERR);
+            result.set_error_msg(e.to_string());
+        }
+    };
+    Ok(())
+}
+
+fn handle_upgrade(s: &mut Socket, version: &str) -> IOResult<()> {
+    // Upgrade to a new release
+    let mut result = OpResult::new();
+    match ceph_upgrade::upgrade_node() {
+        Ok(vers) => {
+            result.set_result(ResultType::OK);
+            let encoded = result.write_to_bytes().map_err(
+                |e| Error::new(ErrorKind::Other, e),
+            )?;
+            let msg = Message::from_slice(&encoded)?;
+            debug!("Responding to client with msg len: {}", msg.len());
+            s.send_msg(msg, 0)?;
+        }
+        Err(e) => {
+            result.set_result(ResultType::ERR);
+            result.set_error_msg(e.to_string());
+        }
+    };
+    Ok(())
+}
+
+fn connect(host: &str, port: &str) -> ZmqResult<Socket> {
+    debug!("Starting zmq sender with version({:?})", zmq::version());
+    let context = zmq::Context::new();
+    let requester = context.socket(zmq::REQ)?;
+
+    debug!("Connecting to tcp://{}:{}", host, port);
+    assert!(
+        requester
+            .connect(&format!("tcp://{}:{}", host, port))
+            .is_ok()
+    );
+    Ok(requester)
+}
+
+fn upgrade_request(s: &mut Socket, version: &str) -> Result<(), String> {
+    let mut o = Operation::new();
+    debug!("Creating upgrade operation request");
+    o.set_Op_type(Op::Upgrade);
+    o.set_version(version.into());
+
+    let encoded = o.write_to_bytes().unwrap();
+    let msg = Message::from_slice(&encoded).map_err(|e| e.to_string())?;
+    debug!("Sending message");
+    s.send_msg(msg, 0).map_err(|e| e.to_string())?;
+
+    debug!("Waiting for response");
+    let upgrade_response = s.recv_bytes(0).map_err(|e| e.to_string())?;
+    debug!("Decoding msg len: {}", upgrade_response.len());
+    let op_result = parse_from_bytes::<api::service::OpResult>(&upgrade_response)
+        .map_err(|e| e.to_string())?;
+    match op_result.get_result() {
+        ResultType::OK => {
+            debug!("Upgrade successful");
+            Ok(())
+        }
+        ResultType::ERR => {
+            if op_result.has_error_msg() {
+                let msg = op_result.get_error_msg();
+                error!("Upgrade failed: {}", msg);
+                Err(op_result.get_error_msg().into())
+            } else {
+                error!("Upgrade failed but error_msg not set");
+                Err("Upgrade failed but error_msg not set".to_string())
+            }
+        }
+    }
+}
+
 
 // Upload this binary to all hosts on a host:port combo and launch it
 fn upload_and_execute(hosts: Vec<(String, u16)>, listen_port: u16) -> Result<(), String> {
+    // Create an ssh mastercontrol port.
+    // Run an ssh command over the port to get to the first host
+    // discover the topology of the cluster
+    // copy this binary to all the other hosts in the cluster
+    // startup the binary and have it listen on a port
+    // shutdown the ssh mastercontrol port and use zmq to connect to all the machines
+    Ok(())
+}
+
+fn create_multiplex(host: &str, user: Option<&str>) -> IOResult<()> {
+    let mut c = Command::new("ssh").args(&["-A", "-M", "-S", "mastercontrol"]);
+    if let Some(user) = user {
+        c.arg(&format!("{}@{}", user, host));
+    } else {
+        c.arg(host);
+    }
     Ok(())
 }
 
 fn main() {
+    let matches = App::new("Fleet Upgrade")
+        .version(crate_version!())
+        .author(crate_authors!())
+        .about("Upgrade ceph automatically")
+        .arg(
+            Arg::with_name("leader")
+                .help("Is this a leader or follower node.")
+                .long("leader")
+                .short("l")
+                .required(true),
+        )
+        .arg(
+            Arg::with_name("log")
+                .default_value("/var/log/bynar-disk-manager.log")
+                .help("Default log file location")
+                .long("logfile")
+                .takes_value(true)
+                .required(false),
+        )
+        .arg(
+            Arg::with_name("port")
+                .default_value("5556")
+                .help("Port to listen on")
+                .long("port")
+                .takes_value(true)
+                .required(false),
+        )
+        .arg(Arg::with_name("v").short("v").multiple(true).help(
+            "Sets the level of verbosity",
+        ))
+        .get_matches();
+    let level = match matches.occurrences_of("v") {
+        0 => log::LogLevelFilter::Info, //default
+        1 => log::LogLevelFilter::Debug,
+        _ => log::LogLevelFilter::Trace,
+    };
+    let _ = CombinedLogger::init(vec![
+        TermLogger::new(level, Config::default()).unwrap(),
+        WriteLogger::new(
+            level,
+            Config::default(),
+            File::create(matches.value_of("log").unwrap()).unwrap()
+        ),
+    ]);
     let v = Version::parse("1:21.7-3").unwrap();
-    ceph_upgrade::discover_topology();
-    ceph_upgrade::roll_cluster(&v);
+    if matches.is_present("leader") {
+        //Initiate the discovery leader
+        let cluster_hosts = ceph_upgrade::discover_topology().unwrap();
+        ceph_upgrade::roll_cluster(&v, cluster_hosts);
+    } else {
+        //follower
+        //start up a listener
+    }
 }
 
 // Generic update to handle rhel/centos or ubuntu/debian

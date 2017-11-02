@@ -8,32 +8,24 @@ extern crate regex;
 extern crate semver;
 extern crate uuid;
 
-use std::fs::{create_dir, copy, File, metadata, OpenOptions, read_dir, remove_file};
-use std::io::{BufRead, BufReader, Read, Write};
+use std::fs::{copy, File, metadata, read_dir, remove_file};
+use std::io::{BufRead, Write};
 use std::io::Result as IOResult;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::str::FromStr;
-use std::thread;
 use std::time::SystemTime;
 
 use self::ceph_rust::ceph::{connect_to_ceph, ceph_version, disconnect_from_ceph};
 use self::ceph_rust::cmd::{mon_dump, osd_tree};
-use self::ceph_rust::error::RadosResult;
-use self::chrono::*;
 use self::init_daemon::{detect_daemon, Daemon};
 use self::nix::unistd::chown;
-use self::rand::distributions::{IndependentSample, Range};
-use self::regex::Regex;
 use self::semver::Version as SemVer;
-use self::uuid::Uuid;
 
 use super::apt;
 use super::debian::version::Version;
 use super::os_type;
-use super::Upgrade;
-
 
 fn backup_conf_files() -> IOResult<Vec<PathBuf>> {
     debug!("Backing up /etc/ceph config files to /tmp");
@@ -58,34 +50,12 @@ fn restore_conf_files(files: &Vec<PathBuf>) -> IOResult<()> {
     Ok(())
 }
 
-// Get the GPG key for the ceph repo
-fn get_gpg_key() -> IOResult<()> {
-    Ok(())
-}
-
-// Create the apt proxy file so that apt can reach the ceph upstream repo from behind
-// a firewall
-fn create_apt_proxy(http_endpoint: &str, https_endpoint: &str) -> IOResult<usize> {
-    debug!("Ensuring apt proxy exists");
-    let mut bytes_written = 0;
-    let mut f = File::create("/etc/apt/apt.conf.d/60proxy")?;
-    bytes_written += f.write(
-        format!("Acquire::http::Proxy \"{}\";", http_endpoint)
-            .as_bytes(),
-    )?;
-    bytes_written += f.write(
-        format!("Acquire::https::Proxy \"{}\";", https_endpoint)
-            .as_bytes(),
-    )?;
-
-    Ok(bytes_written)
-}
-
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum CephType {
-    Mon { id: String, rank: u8 },
+    Mon,
     Osd,
-    Mds { id: String },
-    Rgw { id: String },
+    Mds,
+    Rgw,
 }
 
 enum CephVersion {
@@ -104,38 +74,42 @@ enum CephVersion {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CephServer {
     pub ip_addr: IpAddr,
+    pub id: String,
+    pub rank: Option<i64>,
 }
 
 struct CephNode {
     pub os_information: os_type::OSInformation,
 }
 
-// TODO Ensure that the /etc/apt/apt.conf.d/60proxy is in place
-fn ensure_proxy() {
-    //
-
-}
-
-pub fn discover_topology() -> RadosResult<Vec<(CephServer, CephType)>> {
+pub fn discover_topology() -> Result<Vec<(CephServer, CephType)>, String> {
     let mut cluster: Vec<(CephServer, CephType)> = Vec::new();
-    let handle = connect_to_ceph("admin", "/etc/ceph/ceph.conf")?;
+    let handle = connect_to_ceph("admin", "/etc/ceph/ceph.conf").map_err(
+        |e| {
+            e.to_string()
+        },
+    )?;
 
-    let mon_info = mon_dump(handle)?;
+    let mon_info = mon_dump(handle).map_err(|e| e.to_string())?;
     for mon in mon_info.mons {
         cluster.push((
             CephServer {
-                ip_addr: IpAddr::from_str(mon.addr.split(""))?,
-            },
-            CephType::Mon {
+                ip_addr: IpAddr::from_str(mon.addr.split("").next().unwrap())
+                    .map_err(|e| e.to_string())?,
                 id: mon.name,
-                rank: 0,
+                rank: Some(mon.rank),
             },
+            CephType::Mon,
         ));
     }
-    let osd_info = osd_tree(handle)?;
+    let osd_info = osd_tree(handle).map_err(|e| e.to_string())?;
     for osd in osd_info.nodes {
         cluster.push((
-            CephServer { ip_addr: IpAddr::from_str("")? },
+            CephServer {
+                ip_addr: IpAddr::from_str("").map_err(|e| e.to_string())?,
+                id: "".to_string(),
+                rank: None,
+            },
             CephType::Osd,
         ))
     }
@@ -143,21 +117,70 @@ pub fn discover_topology() -> RadosResult<Vec<(CephServer, CephType)>> {
     Ok(cluster)
 }
 
+fn connect_and_upgrade(servers: Vec<CephServer>) -> Result<(), String> {
+    for s in servers {
+        debug!("Connecting to {} to request upgrade", s.ip_addr);
+        let req_socket = super::connect(&s.ip_addr.to_string(), "5556").map_err(
+            |e| {
+                e.to_string()
+            },
+        )?;
+        debug!("Requesting {} to upgrade", s.ip_addr);
+        match super::upgrade_request(&mut req_socket, "") {
+            Ok(_) => {
+                info!("Upgrade succeeded.  Proceeding to next");
+                continue;
+            }
+            Err(e) => {
+                error!("Upgrade failed.  Recording error");
+                continue;
+            }
+        };
+    }
+    Ok(())
+}
+
 ///Main function to call which implements the upgrade logic
-pub fn roll_cluster(new_version: &Version) -> Result<(), String> {
-    // Gather a list of all nodes in the cluster
+pub fn roll_cluster(
+    new_version: &Version,
+    hosts: Vec<(CephServer, CephType)>,
+) -> Result<(), String> {
     // Upgrade all mons in the cluster 1 by 1
     // Inspect the cluster health to make sure the mon upgrades were successful
     // Upgrade all osds in the cluster 1 by 1
     // Inspect the cluster health to make sure the osd upgrades were successful
     // Upgrade all mds in the cluster 1 by 1
     // Upgrade all rgw in the cluster 1 by 1
+    let mons: Vec<CephServer> = hosts
+        .iter()
+        .filter(|c| c.1 == CephType::Mon)
+        .map(|c| c.0)
+        .collect();
+    let osds: Vec<CephServer> = hosts
+        .iter()
+        .filter(|c| c.1 == CephType::Osd)
+        .map(|c| c.0)
+        .collect();
+    let mds: Vec<CephServer> = hosts
+        .iter()
+        .filter(|c| c.1 == CephType::Mds)
+        .map(|c| c.0)
+        .collect();
+    let rgws: Vec<CephServer> = hosts
+        .iter()
+        .filter(|c| c.1 == CephType::Rgw)
+        .map(|c| c.0)
+        .collect();
+    connect_and_upgrade(mons)?;
+    connect_and_upgrade(osds)?;
+    connect_and_upgrade(mds)?;
+    connect_and_upgrade(rgws)?;
     return Ok(());
 }
 
 // Edge cases:
 // 1. Previous node dies on upgrade, can we retry?
-impl Upgrade for CephNode {
+impl CephNode {
     fn upgrade_node(&self, version: String) -> Result<(), String> {
         debug!(
             "Upgrading from {} to {}",
@@ -239,9 +262,7 @@ systemctl start ceph-osd.target
 
         return Ok(());
     }
-}
 
-impl CephNode {
     ///Stops the specified OSD number.
     fn stop_osd(&self, osd_num: u64) -> ::std::io::Result<()> {
         let init_daemon = detect_daemon().map_err(|e| {
@@ -380,20 +401,13 @@ impl CephNode {
                 }
             }.trim_right_matches(".asok");
             if file_name.starts_with("ceph-mon") {
-                ceph_processes.push(CephType::Mon {
-                    id: file_name.trim_left_matches("ceph-mon.").into(),
-                    rank: 0,
-                });
+                ceph_processes.push(CephType::Mon);
             } else if file_name.starts_with("ceph-osd") {
                 ceph_processes.push(CephType::Osd);
             } else if file_name.starts_with("ceph-mds") {
-                ceph_processes.push(CephType::Mds {
-                    id: file_name.trim_left_matches("ceph-mds.").into(),
-                });
+                ceph_processes.push(CephType::Mds);
             } else if file_name.starts_with("ceph-rgw") {
-                ceph_processes.push(CephType::Rgw {
-                    id: file_name.trim_left_matches("ceph-rgw.").into(),
-                });
+                ceph_processes.push(CephType::Rgw);
             }
         }
         Ok(ceph_processes)
@@ -436,10 +450,10 @@ fn ceph_release(socket: &str) -> Option<CephVersion> {
 
 fn ceph_user(c: CephType) -> Result<String, String> {
     let socket = match c {
-        CephType::Mds { ref id } => "",
-        CephType::Mon { ref id, ref rank } => "",
+        CephType::Mds => "",
+        CephType::Mon => "",
         CephType::Osd => "",
-        CephType::Rgw { ref id } => "",
+        CephType::Rgw => "",
     };
     let release = ceph_release("");
     Ok("ceph".into())
@@ -451,10 +465,7 @@ fn ceph_user(c: CephType) -> Result<String, String> {
 ///so this method will issue a set_status for any changes of ownership which
 ///recurses into directory structures.
 fn update_owner(path: &Path, recurse_dirs: bool) -> ::std::io::Result<()> {
-    let user = ceph_user(CephType::Mon {
-        id: "".into(),
-        rank: 0,
-    }).unwrap();
+    let user = ceph_user(CephType::Mon).unwrap();
     let user_group = format!("{ceph_user}:{ceph_user}", ceph_user = user);
     let mut cmd: Vec<String> = vec![
         "chown".into(),
