@@ -4,11 +4,28 @@ option optimize_for = SPEED;
 package ceph_fleet_update;
 
 // Result that returns a string
-message StringResult {
+message VersionResult {
   required ResultType result = 1;
-  optional string output = 2;
+  optional Version version = 2;
   optional string error_msg = 3;
 }
+
+// Debian specific Version messages
+message Version {
+  required uint32 epoch = 1;
+  required VersionPart upstream_version = 2;
+  required VersionPart debian_revision = 3;
+}
+
+message VersionElement {
+  required string alpha = 1;
+  required uint64 numeric = 2;
+}
+
+message VersionPart {
+  repeated VersionElement elements = 1;
+}
+// Debian specific Version messages
 
 message OpResult {
   required ResultType result = 1;
@@ -22,10 +39,11 @@ enum ResultType{
 
 enum Op {
   // What version are you currently running
-  Version = 1;
+  InstalledVersion = 1;
+  RunningVersion = 2;
   // Start upgrading yourself
-  Upgrade = 2;
-  Stop = 3;
+  Upgrade = 3;
+  Stop = 4;
 }
 
 // Service operations that can be performed

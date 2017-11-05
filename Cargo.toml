@@ -5,6 +5,7 @@ authors = ["Chris Holcombe <xfactor973@gmail.com>"]
 
 [dependencies]
 api = { path = "api" }
+apt-pkg-native = "*"
 ceph-rust = {path = "/home/chris/repos/ceph-rust" } #"~0.1"
 clap = "*"
 chrono = { version = "~0.4", features = ["rustc-serialize"] }

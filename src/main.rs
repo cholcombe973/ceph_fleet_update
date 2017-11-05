@@ -6,7 +6,9 @@ extern crate debian;
 extern crate log;
 extern crate os_type;
 extern crate protobuf;
+extern crate semver;
 extern crate simplelog;
+extern crate slack_hook;
 extern crate uuid;
 extern crate zmq;
 
@@ -17,15 +19,21 @@ use std::fs::File;
 use std::io::{Error, ErrorKind};
 use std::io::Result as IOResult;
 use std::process::Command;
+use std::str::FromStr;
 use std::thread;
 use std::time::Duration;
 
-use api::service::{Op, Operation, ResultType, OpResult, StringResult};
+use api::service::{Op, Operation, ResultType, OpResult, Version, VersionElement, VersionPart,
+                   VersionResult};
+use ceph_upgrade::{get_running_version, CephType, CephNode};
 use clap::{Arg, App};
-use debian::version::Version;
+use debian::version::Version as DebianVersion;
 use protobuf::Message as ProtobufMsg;
 use protobuf::core::parse_from_bytes;
+use protobuf::repeated::RepeatedField;
+use semver::Version as SemVer;
 use simplelog::{Config, CombinedLogger, TermLogger, WriteLogger};
+use slack_hook::{Slack, PayloadBuilder};
 use zmq::{Message, Socket};
 use zmq::Result as ZmqResult;
 
@@ -49,23 +57,33 @@ fn listen(port: &str) -> ZmqResult<()> {
         let operation = match parse_from_bytes::<api::service::Operation>(&msg) {
             Ok(bytes) => bytes,
             Err(e) => {
-                error!("Failed to parse_from_bytes {:?}.  Ignoring request", e);
+                error!("Failed parse_from_bytes {:?}.  Ignoring request", e);
                 continue;
             }
         };
 
         debug!("Operation requested: {:?}", operation.get_Op_type());
         match operation.get_Op_type() {
-            Op::Version => {
-                // Get the ceph verstion running and also the dpkg installed version
-                match handle_get_version(&mut responder) {
+            Op::InstalledVersion => {
+                match handle_get_installed_version(&mut responder) {
                     Ok(_) => {
-                        info!("Get version successful");
+                        info!("Get installed version successful");
                     }
                     Err(e) => {
-                        error!("Get version error: {:?}", e);
+                        error!("Get installed version error: {:?}", e);
                     }
                 };
+            }
+            Op::RunningVersion => {
+                match handle_get_running_version(&mut responder) {
+                    Ok(_) => {
+                        info!("Get running version successful");
+                    }
+                    Err(e) => {
+                        error!("Get running version error: {:?}", e);
+                    }
+                };
+
             }
             Op::Upgrade => {
                 if !operation.has_version() {
@@ -92,12 +110,121 @@ fn listen(port: &str) -> ZmqResult<()> {
     }
 }
 
-fn handle_get_version(s: &mut Socket) -> IOResult<()> {
-    let mut result = StringResult::new();
-    match ceph_upgrade::get_version() {
+fn notify_slack(
+    webhook: &str,
+    channel: &str,
+    bot_name: &str,
+    msg: &str,
+) -> Result<(), slack_hook::Error> {
+    let slack = Slack::new(webhook)?;
+    let p = PayloadBuilder::new()
+        .text(msg)
+        .channel(channel)
+        .username(bot_name)
+        .build()?;
+
+    let res = slack.send(&p);
+    match res {
+        Ok(_) => debug!("Slack notified"),
+        Err(e) => error!("Slack error: {:?}", e),
+    };
+    Ok(())
+}
+
+fn semver_to_protobuf(v: SemVer) -> Version {
+    let mut version_msg = Version::new();
+    let mut upstream = VersionPart::new();
+
+    let mut major = VersionElement::new();
+    major.set_alpha("".into());
+    major.set_numeric(v.major);
+
+    let mut minor = VersionElement::new();
+    minor.set_alpha(".".into());
+    minor.set_numeric(v.minor);
+
+    let mut patch = VersionElement::new();
+    patch.set_alpha(".".into());
+    patch.set_numeric(v.patch);
+
+    let elements: Vec<VersionElement> = vec![major, minor, patch];
+    let upstream_elements: RepeatedField<VersionElement> = RepeatedField::from_vec(elements);
+
+    upstream.set_elements(upstream_elements);
+    version_msg.set_epoch(0);
+    version_msg.set_upstream_version(upstream);
+
+    version_msg
+}
+
+fn version_to_protobuf(v: DebianVersion) -> Version {
+    let mut version_msg = Version::new();
+    let mut upstream = VersionPart::new();
+    let mut debian = VersionPart::new();
+
+    let upstream_elements: RepeatedField<VersionElement> = RepeatedField::from_vec(
+        v.upstream_version
+            .elements
+            .iter()
+            .map(|e| {
+                let mut v = VersionElement::new();
+                v.set_alpha(e.alpha);
+                v.set_numeric(e.numeric);
+                v
+            })
+            .collect(),
+    );
+    let debian_elements: RepeatedField<VersionElement> = RepeatedField::from_vec(
+        v.debian_revision
+            .elements
+            .iter()
+            .map(|e| {
+                let mut v = VersionElement::new();
+                v.set_alpha(e.alpha);
+                v.set_numeric(e.numeric);
+                v
+            })
+            .collect(),
+    );
+    upstream.set_elements(upstream_elements);
+    debian.set_elements(debian_elements);
+
+    version_msg.set_epoch(v.epoch);
+    version_msg.set_upstream_version(upstream);
+    version_msg.set_debian_revision(debian);
+
+    version_msg
+}
+
+fn handle_get_installed_version(s: &mut Socket) -> IOResult<()> {
+    let mut result = VersionResult::new();
+    match apt::get_installed_package_version("ceph") {
         Ok(vers) => {
             result.set_result(ResultType::OK);
-            result.set_output(vers);
+            let v = version_to_protobuf(vers);
+            result.set_version(v);
+            let encoded = result.write_to_bytes().map_err(
+                |e| Error::new(ErrorKind::Other, e),
+            )?;
+            let msg = Message::from_slice(&encoded)?;
+            debug!("Responding to client with msg len: {}", msg.len());
+            s.send_msg(msg, 0)?;
+        }
+        Err(e) => {
+            result.set_result(ResultType::ERR);
+            result.set_error_msg(e.to_string());
+        }
+    };
+    Ok(())
+}
+
+fn handle_get_running_version(s: &mut Socket) -> IOResult<()> {
+    let mut result = VersionResult::new();
+    match get_running_version(CephType::Osd) {
+        Ok(vers) => {
+            result.set_result(ResultType::OK);
+            let v = semver_to_protobuf(vers);
+            result.set_version(v);
             let encoded = result.write_to_bytes().map_err(
                 |e| Error::new(ErrorKind::Other, e),
             )?;
@@ -116,7 +243,8 @@ fn handle_get_version(s: &mut Socket) -> IOResult<()> {
 fn handle_upgrade(s: &mut Socket, version: &str) -> IOResult<()> {
     // Upgrade to a new release
     let mut result = OpResult::new();
-    match ceph_upgrade::upgrade_node() {
+    let c = CephNode::new();
+    match c.upgrade_node(version) {
         Ok(vers) => {
             result.set_result(ResultType::OK);
             let encoded = result.write_to_bytes().map_err(
@@ -134,7 +262,7 @@ fn handle_upgrade(s: &mut Socket, version: &str) -> IOResult<()> {
     Ok(())
 }
 
-fn connect(host: &str, port: &str) -> ZmqResult<Socket> {
+fn connect(host: &str, port: u16) -> ZmqResult<Socket> {
     debug!("Starting zmq sender with version({:?})", zmq::version());
     let context = zmq::Context::new();
     let requester = context.socket(zmq::REQ)?;
@@ -205,7 +333,7 @@ fn create_multiplex(host: &str, user: Option<&str>) -> IOResult<()> {
 }
 
 fn main() {
-    let matches = App::new("Fleet Upgrade")
+    let matches = App::new("Skynet")
         .version(crate_version!())
         .author(crate_authors!())
         .about("Upgrade ceph automatically")
@@ -214,11 +342,11 @@ fn main() {
                 .help("Is this a leader or follower node.")
                 .long("leader")
                 .short("l")
-                .required(true),
+                .required(false),
         )
         .arg(
             Arg::with_name("log")
-                .default_value("/var/log/bynar-disk-manager.log")
+                .default_value("/var/log/skynet.log")
                 .help("Default log file location")
                 .long("logfile")
                 .takes_value(true)
@@ -249,11 +377,17 @@ fn main() {
             File::create(matches.value_of("log").unwrap()).unwrap()
         ),
     ]);
-    let v = Version::parse("1:21.7-3").unwrap();
+    let port = u16::from_str(matches.value_of("port").unwrap()).unwrap();
+    let v = DebianVersion::parse("1:21.7-3").unwrap();
     if matches.is_present("leader") {
         //Initiate the discovery leader
-        let cluster_hosts = ceph_upgrade::discover_topology().unwrap();
-        ceph_upgrade::roll_cluster(&v, cluster_hosts);
+        let cluster_hosts = ceph_upgrade::discover_topology();
+        debug!("Cluster hosts: {:?}", cluster_hosts);
+        if let Err(e) = upload_and_execute(vec![], port) {
+            error!("Uploading and starting binaries failed. exiting");
+            return;
+        }
+    //ceph_upgrade::roll_cluster(&v, cluster_hosts);
     } else {
         //follower
         //start up a listener

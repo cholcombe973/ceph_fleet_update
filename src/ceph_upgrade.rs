@@ -9,7 +9,7 @@ extern crate semver;
 extern crate uuid;
 
 use std::fs::{copy, File, metadata, read_dir, remove_file};
-use std::io::{BufRead, Write};
+use std::io::{Error, ErrorKind, BufRead, Write};
 use std::io::Result as IOResult;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
@@ -51,13 +51,14 @@ fn restore_conf_files(files: &Vec<PathBuf>) -> IOResult<()> {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-enum CephType {
+pub enum CephType {
     Mon,
     Osd,
     Mds,
     Rgw,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum CephVersion {
     Dumpling,
     Emperor,
@@ -78,7 +79,8 @@ pub struct CephServer {
     pub rank: Option<i64>,
 }
 
-struct CephNode {
+#[derive(Debug)]
+pub struct CephNode {
     pub os_information: os_type::OSInformation,
 }
 
@@ -117,14 +119,12 @@ pub fn discover_topology() -> Result<Vec<(CephServer, CephType)>, String> {
     Ok(cluster)
 }
 
-fn connect_and_upgrade(servers: Vec<CephServer>) -> Result<(), String> {
+fn connect_and_upgrade(servers: Vec<CephServer>, port: u16) -> Result<(), String> {
     for s in servers {
         debug!("Connecting to {} to request upgrade", s.ip_addr);
-        let req_socket = super::connect(&s.ip_addr.to_string(), "5556").map_err(
-            |e| {
-                e.to_string()
-            },
-        )?;
+        let req_socket = super::connect(&s.ip_addr.to_string(), port).map_err(|e| {
+            e.to_string()
+        })?;
         debug!("Requesting {} to upgrade", s.ip_addr);
         match super::upgrade_request(&mut req_socket, "") {
             Ok(_) => {
@@ -144,6 +144,7 @@ fn connect_and_upgrade(servers: Vec<CephServer>) -> Result<(), String> {
 pub fn roll_cluster(
     new_version: &Version,
     hosts: Vec<(CephServer, CephType)>,
+    port: u16,
 ) -> Result<(), String> {
     // Upgrade all mons in the cluster 1 by 1
     // Inspect the cluster health to make sure the mon upgrades were successful
@@ -171,35 +172,20 @@ pub fn roll_cluster(
         .filter(|c| c.1 == CephType::Rgw)
         .map(|c| c.0)
         .collect();
-    connect_and_upgrade(mons)?;
-    connect_and_upgrade(osds)?;
-    connect_and_upgrade(mds)?;
-    connect_and_upgrade(rgws)?;
+    connect_and_upgrade(mons, port)?;
+    connect_and_upgrade(osds, port)?;
+    connect_and_upgrade(mds, port)?;
+    connect_and_upgrade(rgws, port)?;
     return Ok(());
 }
 
 // Edge cases:
 // 1. Previous node dies on upgrade, can we retry?
 impl CephNode {
-    fn upgrade_node(&self, version: String) -> Result<(), String> {
-        debug!(
-            "Upgrading from {} to {}",
-            ceph_version("/var/run/ceph/...").unwrap_or("".into()),
-            version
-        );
-        self.upgrade_mon(version.clone());
-        return Ok(());
+    pub fn new() -> Self {
+        CephNode { os_information: os_type::current_platform() }
     }
-    // Any MDS specific upgrade instructions need to go here
-    fn upgrade_mds(&self, new_version: String) -> Result<(), String> {
-        return Ok(());
-    }
-    // Any RGW specific upgrade instructions need to go here
-    fn upgrade_rgw(&self, new_version: String) -> Result<(), String> {
-        return Ok(());
-    }
-    // Any MON specific upgrade instructions need to go here
-    fn upgrade_mon(&self, version: String) -> Result<(), String> {
+    pub fn upgrade_node(&self, version: &str) -> Result<(), String> {
         debug!(
             "Upgrading from {} to {}",
             ceph_version("/var/run/ceph/...").unwrap_or("".into()),
@@ -207,7 +193,6 @@ impl CephNode {
         );
         return Ok(());
     }
-    // Any OSD specific upgrade instructions need to go here
     fn upgrade_osd(&self, version: String) -> Result<(), String> {
         /*
 echo "Stopping osds"
@@ -412,6 +397,58 @@ systemctl start ceph-osd.target
         }
         Ok(ceph_processes)
     }
+}
+
+// Search around for a ceph socket
+fn find_socket(c: CephType) -> IOResult<PathBuf> {
+    debug!("Opening /var/run/ceph to find sockets to connect to");
+    let p = Path::new("/var/run/ceph");
+    for entry in p.read_dir()? {
+        if let Ok(entry) = entry {
+            match c {
+                CephType::Mon => {
+                    if entry.file_name().to_string_lossy().starts_with("ceph-mon") {
+                        return Ok(entry.path());
+                    }
+                }
+                CephType::Osd => {
+                    if entry.file_name().to_string_lossy().starts_with("ceph-osd") {
+                        return Ok(entry.path());
+                    }
+                }
+                CephType::Mds => {
+                    if entry.file_name().to_string_lossy().starts_with("ceph-mds") {
+                        return Ok(entry.path());
+                    }
+                }
+                CephType::Rgw => {
+                    if entry.file_name().to_string_lossy().starts_with("ceph-rgw") {
+                        return Ok(entry.path());
+                    }
+                }
+            }
+        }
+    }
+    return Err(Error::new(ErrorKind::Other, "Unable to find ceph socket"));
+}
+
+// Get the running version of a ceph type ie Mon, Osd, etc
+pub fn get_running_version(c: CephType) -> IOResult<SemVer> {
+    let socket = find_socket(c)?;
+    let v = match ceph_version(&format!("/var/run/ceph/{}", socket.display())) {
+        Some(v) => v,
+        None => {
+            error!("Unable to discover ceph version.  Can't discern correct user");
+            return Err(Error::new(
+                ErrorKind::Other,
+                "Unable to find ceph version".into(),
+            ));
+        }
+    };
+    let ceph_version = SemVer::parse(&v).map_err(
+        |e| Error::new(ErrorKind::Other, e),
+    )?;
+    Ok(ceph_version)
 }
 
 fn ceph_release(socket: &str) -> Option<CephVersion> {

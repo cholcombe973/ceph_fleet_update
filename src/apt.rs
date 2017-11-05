@@ -1,3 +1,4 @@
+extern crate apt_pkg_native;
 extern crate init_daemon;
 extern crate reqwest;
 
@@ -7,6 +8,7 @@ use std::io::Result as IOResult;
 use std::path::Path;
 use std::process::Command;
 
+use self::apt_pkg_native::Cache;
 use self::init_daemon::{detect_daemon, Daemon};
 use super::debian::version::Version;
 
@@ -166,32 +168,29 @@ pub fn service_start(name: &str) -> Result<(), String> {
         }
     };
 }
-/// Ask apt-cache for the new candidate package that is available
+
 pub fn get_candidate_package_version(package_name: &str) -> Result<Version, String> {
-    let mut cmd = Command::new("apt-cache");
-    cmd.arg("policy");
-    cmd.arg(package_name);
-    let output = cmd.output().map_err(|e| e.to_string())?;
-    if !output.status.success() {
-        return Err(String::from_utf8_lossy(&output.stderr).into_owned());
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    for line in stdout.lines() {
-        if line.contains("Candidate") {
-            let parts: Vec<&str> = line.split(' ').collect();
-            match parts.last() {
-                Some(p) => {
-                    let version: Version = Version::parse(p).map_err(|e| e.msg)?;
-                    return Ok(version);
-                }
-                None => {
-                    return Err(format!("Unknown candidate line format: {:?}", parts));
-                }
-            }
+    let mut cache = Cache::get_singleton();
+    let mut found = cache.find_by_name(package_name);
+
+    if let Some(view) = found.next() {
+        match view.candidate_version(){
+            Some(candidate) => return Ok(Version::parse(&candidate).map_err(|e| e.msg)?),
+            None => return Err(format!("Unable to locate package {}", package_name)),
+        }
+    };
+    Err(format!("Unable to locate package {}", package_name))
+}
+
+pub fn get_installed_package_version(package_name: &str) -> Result<Version, String> {
+    let mut cache = Cache::get_singleton();
+    let mut found = cache.find_by_name(package_name);
+
+    if let Some(view) = found.next() {
+        match view.current_version(){
+            Some(installed) => return Ok(Version::parse(&installed).map_err(|e| e.msg)?),
+            None => return Err(format!("Unable to locate package {}", package_name)),
         }
     }
-    Err(format!(
-        "Unable to find candidate upgrade package from stdout: {}",
-        stdout
-    ))
+    Err(format!("Unable to locate package {}", package_name))
 }
