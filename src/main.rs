@@ -168,7 +168,7 @@ fn version_to_protobuf(v: DebianVersion) -> Version {
             .iter()
             .map(|e| {
                 let mut v = VersionElement::new();
-                v.set_alpha(e.alpha);
+                v.set_alpha(e.alpha.clone());
                 v.set_numeric(e.numeric);
                 v
             })
@@ -180,7 +180,7 @@ fn version_to_protobuf(v: DebianVersion) -> Version {
             .iter()
             .map(|e| {
                 let mut v = VersionElement::new();
-                v.set_alpha(e.alpha);
+                v.set_alpha(e.alpha.clone());
                 v.set_numeric(e.numeric);
                 v
             })
@@ -323,7 +323,8 @@ fn upload_and_execute(hosts: Vec<(String, u16)>, listen_port: u16) -> Result<(),
 }
 
 fn create_multiplex(host: &str, user: Option<&str>) -> IOResult<()> {
-    let mut c = Command::new("ssh").args(&["-A", "-M", "-S", "mastercontrol"]);
+    let mut c = Command::new("ssh");
+    c.args(&["-A", "-M", "-S", "mastercontrol"]);
     if let Some(user) = user {
         c.arg(&format!("{}@{}", user, host));
     } else {

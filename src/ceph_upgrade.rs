@@ -36,7 +36,8 @@ fn backup_conf_files() -> IOResult<Vec<PathBuf>> {
         // Should only be conf files in here
         if !path.is_dir() {
             // cp /etc/ceph/ceph.conf /tmp/ceph.conf
-            copy(path, format!("/tmp/{}", path.display()))?;
+            copy(path.clone(), format!("/tmp/{}", path.display()))?;
+            backed_up.push(path.clone());
         }
     }
     Ok(backed_up)
@@ -45,7 +46,7 @@ fn backup_conf_files() -> IOResult<Vec<PathBuf>> {
 fn restore_conf_files(files: &Vec<PathBuf>) -> IOResult<()> {
     debug!("Restoring config files to /etc/ceph");
     for f in files {
-        copy(f, format!("/etc/ceph/{}", f.display()))?;
+        copy(f.clone(), format!("/etc/ceph/{}", f.display()))?;
     }
     Ok(())
 }
@@ -122,7 +123,7 @@ pub fn discover_topology() -> Result<Vec<(CephServer, CephType)>, String> {
 fn connect_and_upgrade(servers: Vec<CephServer>, port: u16) -> Result<(), String> {
     for s in servers {
         debug!("Connecting to {} to request upgrade", s.ip_addr);
-        let req_socket = super::connect(&s.ip_addr.to_string(), port).map_err(|e| {
+        let mut req_socket = super::connect(&s.ip_addr.to_string(), port).map_err(|e| {
             e.to_string()
         })?;
         debug!("Requesting {} to upgrade", s.ip_addr);
@@ -155,22 +156,22 @@ pub fn roll_cluster(
     let mons: Vec<CephServer> = hosts
         .iter()
         .filter(|c| c.1 == CephType::Mon)
-        .map(|c| c.0)
+        .map(|c| c.0.clone())
         .collect();
     let osds: Vec<CephServer> = hosts
         .iter()
         .filter(|c| c.1 == CephType::Osd)
-        .map(|c| c.0)
+        .map(|c| c.0.clone())
         .collect();
     let mds: Vec<CephServer> = hosts
         .iter()
         .filter(|c| c.1 == CephType::Mds)
-        .map(|c| c.0)
+        .map(|c| c.0.clone())
         .collect();
     let rgws: Vec<CephServer> = hosts
         .iter()
         .filter(|c| c.1 == CephType::Rgw)
-        .map(|c| c.0)
+        .map(|c| c.0.clone())
         .collect();
     connect_and_upgrade(mons, port)?;
     connect_and_upgrade(osds, port)?;
@@ -193,7 +194,7 @@ impl CephNode {
         );
         return Ok(());
     }
-    fn upgrade_osd(&self, version: String) -> Result<(), String> {
+    fn upgrade_osd(&self, version: String) -> IOResult<()> {
         /*
 echo "Stopping osds"
 systemctl stop ceph-osd.target
@@ -218,7 +219,7 @@ systemctl start ceph-osd.target
         // install ceph sources if needed
         // apt-get update
         // stop osd
-        self.stop_osd(0);
+        self.stop_osd(0)?;
         //backup ceph conf files
         // Check if these packages exist and remove all
         apt::apt_remove(vec![
@@ -237,19 +238,21 @@ systemctl start ceph-osd.target
             "librbd1",
             "libradosstriper1",
             "librados2",
-        ])?;
-        self.disable_osd(0);
+        ]).map_err(|e| Error::new(ErrorKind::Other, e))?;
+        self.disable_osd(0)?;
         //
-        apt::apt_install(vec!["ceph"])?;
-        update_owner(&Path::new("/var/lib/ceph/osd-?"), true);
-        self.enable_osd(0);
-        self.start_osd(0);
+        apt::apt_install(vec!["ceph"]).map_err(|e| {
+            Error::new(ErrorKind::Other, e)
+        })?;
+        update_owner(&Path::new("/var/lib/ceph/osd-?"), true)?;
+        self.enable_osd(0)?;
+        self.start_osd(0)?;
 
         return Ok(());
     }
 
     ///Stops the specified OSD number.
-    fn stop_osd(&self, osd_num: u64) -> ::std::io::Result<()> {
+    fn stop_osd(&self, osd_num: u64) -> IOResult<()> {
         let init_daemon = detect_daemon().map_err(|e| {
             ::std::io::Error::new(::std::io::ErrorKind::Other, e)
         })?;
@@ -271,7 +274,7 @@ systemctl start ceph-osd.target
         Ok(())
     }
     ///Starts the specified OSD number.
-    fn start_osd(&self, osd_num: u64) -> ::std::io::Result<()> {
+    fn start_osd(&self, osd_num: u64) -> IOResult<()> {
         let init_daemon = detect_daemon().map_err(|e| {
             ::std::io::Error::new(::std::io::ErrorKind::Other, e)
         })?;
@@ -297,7 +300,7 @@ systemctl start ceph-osd.target
     ///next reboot of the system. Due to differences between init systems,
     ///this method cannot make any guarantees that the specified osd cannot be
     ///started manually.
-    fn disable_osd(&self, osd_num: u64) -> ::std::io::Result<()> {
+    fn disable_osd(&self, osd_num: u64) -> IOResult<()> {
         let init_daemon = detect_daemon().map_err(|e| {
             ::std::io::Error::new(::std::io::ErrorKind::Other, e)
         })?;
@@ -328,7 +331,7 @@ systemctl start ceph-osd.target
             .iter()
             .collect();
         if ready_file.exists() {
-            remove_file(ready_file);
+            remove_file(ready_file)?;
         }
         Ok(())
     }
@@ -336,7 +339,7 @@ systemctl start ceph-osd.target
     ///Ensures that the specified osd_num will be enabled and ready to start
     ///automatically in the event of a reboot.
     ///osd_num: the osd id which should be enabled.
-    fn enable_osd(&self, osd_num: u64) -> ::std::io::Result<()> {
+    fn enable_osd(&self, osd_num: u64) -> IOResult<()> {
         let init_daemon = detect_daemon().map_err(|e| {
             ::std::io::Error::new(::std::io::ErrorKind::Other, e)
         })?;
@@ -354,13 +357,13 @@ systemctl start ceph-osd.target
         let ready_file_path: PathBuf = ["/var/lib/ceph", &format!("ceph-{}", osd_num), "ready"]
             .iter()
             .collect();
-        let mut file = File::create(ready_file_path)?;
+        let mut file = File::create(&ready_file_path)?;
         file.write_all(b"ready")?;
 
         // Make sure the correct user owns the file. It shouldn't be necessary
         // as the upstart script should run with root privileges, but its better
         // to have all the files matching ownership.
-        update_owner(&ready_file_path, true);
+        update_owner(&ready_file_path, true)?;
         Ok(())
     }
 
@@ -429,20 +432,17 @@ fn find_socket(c: CephType) -> IOResult<PathBuf> {
             }
         }
     }
-    return Err(Error::new(ErrorKind::Other, "Unable to find ceph socket"));
+    Err(Error::new(ErrorKind::Other, "Unable to find ceph socket"))
 }
 
 // Get the running version of a ceph type ie Mon, Osd, etc
 pub fn get_running_version(c: CephType) -> IOResult<SemVer> {
-    let socket = find_socket(c)?;
+    let socket = find_socket(c).map_err(|e| Error::new(ErrorKind::Other, e))?;
     let v = match ceph_version(&format!("/var/run/ceph/{}", socket.display())) {
         Some(v) => v,
         None => {
             error!("Unable to discover ceph version.  Can't discern correct user");
-            return Err(Error::new(
-                ErrorKind::Other,
-                "Unable to find ceph version".into(),
-            ));
+            return Err(Error::new(ErrorKind::Other, "Unable to find ceph version"));
         }
     };
     let ceph_version = SemVer::parse(&v).map_err(
@@ -501,21 +501,21 @@ fn ceph_user(c: CephType) -> Result<String, String> {
 ///using the system's native chown functionality. This may take awhile,
 ///so this method will issue a set_status for any changes of ownership which
 ///recurses into directory structures.
-fn update_owner(path: &Path, recurse_dirs: bool) -> ::std::io::Result<()> {
+fn update_owner(path: &Path, recurse_dirs: bool) -> IOResult<()> {
     let user = ceph_user(CephType::Mon).unwrap();
     let user_group = format!("{ceph_user}:{ceph_user}", ceph_user = user);
+    debug!("Changing ownership of {:?} to {}", path, user_group);
     let mut cmd: Vec<String> = vec![
         "chown".into(),
-        user_group,
+        user_group.clone(),
         path.to_string_lossy().into_owned(),
     ];
     if metadata(path)?.is_dir() && recurse_dirs {
         cmd.insert(1, "-R".into());
     }
-    debug!("Changing ownership of {:?} to {}", path, user_group);
     let start = SystemTime::now();
     Command::new("chown")
-        .args(&[user_group, path.to_string_lossy().into_owned()])
+        .args(&[user_group.clone(), path.to_string_lossy().into_owned()])
         .output()?;
     let elapsed_time = start.duration_since(start).unwrap();
 

@@ -91,10 +91,11 @@ fn create_apt_proxy(http_endpoint: &str, https_endpoint: &str) -> IOResult<usize
 
 /// Ensure that the /etc/apt/apt.conf.d/60proxy is in place with the proper
 /// endpoints
-pub fn ensure_proxy(http_endpoint: &str, https_endpoint: &str) {
+pub fn ensure_proxy(http_endpoint: &str, https_endpoint: &str) -> IOResult<()> {
     if !Path::new("/etc/apt/apt.conf.d/60proxy").exists() {
-        create_apt_proxy(http_endpoint, https_endpoint);
+        create_apt_proxy(http_endpoint, https_endpoint)?;
     }
+    Ok(())
 }
 
 // Get the GPG key for the ceph repo
@@ -102,7 +103,7 @@ pub fn get_gpg_key(l: &str) -> IOResult<String> {
     let mut resp = reqwest::get(l).map_err(|e| Error::new(ErrorKind::Other, e))?;
     if resp.status().is_success() {
         let mut content = String::new();
-        resp.read_to_string(&mut content);
+        resp.read_to_string(&mut content)?;
         return Ok(content);
     } else {
         return Err(Error::new(
@@ -174,7 +175,7 @@ pub fn get_candidate_package_version(package_name: &str) -> Result<Version, Stri
     let mut found = cache.find_by_name(package_name);
 
     if let Some(view) = found.next() {
-        match view.candidate_version(){
+        match view.candidate_version() {
             Some(candidate) => return Ok(Version::parse(&candidate).map_err(|e| e.msg)?),
             None => return Err(format!("Unable to locate package {}", package_name)),
         }
@@ -187,7 +188,7 @@ pub fn get_installed_package_version(package_name: &str) -> Result<Version, Stri
     let mut found = cache.find_by_name(package_name);
 
     if let Some(view) = found.next() {
-        match view.current_version(){
+        match view.current_version() {
             Some(installed) => return Ok(Version::parse(&installed).map_err(|e| e.msg)?),
             None => return Err(format!("Unable to locate package {}", package_name)),
         }
