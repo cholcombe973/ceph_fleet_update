@@ -1,5 +1,4 @@
 extern crate apt_pkg_native;
-extern crate init_daemon;
 extern crate reqwest;
 
 use std::fs::File;
@@ -9,36 +8,41 @@ use std::path::Path;
 use std::process::Command;
 
 use self::apt_pkg_native::Cache;
-use self::init_daemon::{detect_daemon, Daemon};
 use super::debian::version::Version;
 
 // Add a ppa source to apt
-pub fn add_source(source_string: &str) -> Result<(), String> {
+pub fn add_source(source_string: &str) -> IOResult<()> {
     let mut cmd = Command::new("add-apt-repository");
     cmd.arg("-y");
     cmd.arg(source_string);
     debug!("add-apt-repository cmd: {:?}", cmd);
-    let output = cmd.output().map_err(|e| e.to_string())?;
+    let output = cmd.output()?;
     if !output.status.success() {
-        return Err(String::from_utf8_lossy(&output.stderr).into_owned());
+        return Err(Error::new(
+            ErrorKind::Other,
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        ));
     }
     return Ok(());
 }
 
 // Update the apt database to get the latest packages
-pub fn apt_update() -> Result<(), String> {
+pub fn apt_update() -> IOResult<()> {
     let mut cmd = Command::new("apt-get");
     cmd.arg("update");
     cmd.arg("-q");
-    let output = cmd.output().map_err(|e| e.to_string())?;
+    let output = cmd.output()?;
     if !output.status.success() {
-        return Err(String::from_utf8_lossy(&output.stderr).into_owned());
+        return Err(Error::new(
+            ErrorKind::Other,
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        ));
     }
     return Ok(());
 }
 
 /// Install a list of packages
-pub fn apt_install(packages: Vec<&str>) -> Result<(), String> {
+pub fn apt_install(packages: Vec<&str>) -> IOResult<()> {
     let mut cmd = Command::new("apt-get");
     cmd.arg("install");
     cmd.arg("-q");
@@ -46,15 +50,18 @@ pub fn apt_install(packages: Vec<&str>) -> Result<(), String> {
     for package in packages {
         cmd.arg(package);
     }
-    let output = cmd.output().map_err(|e| e.to_string())?;
+    let output = cmd.output()?;
     if !output.status.success() {
-        return Err(String::from_utf8_lossy(&output.stderr).into_owned());
+        return Err(Error::new(
+            ErrorKind::Other,
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        ));
     }
     return Ok(());
 }
 
 /// Remove a list of packages
-pub fn apt_remove(packages: Vec<&str>) -> Result<(), String> {
+pub fn apt_remove(packages: Vec<&str>) -> IOResult<()> {
     let mut cmd = Command::new("apt-get");
     cmd.arg("remove");
     cmd.arg("-q");
@@ -63,9 +70,12 @@ pub fn apt_remove(packages: Vec<&str>) -> Result<(), String> {
         cmd.arg(package);
     }
     cmd.arg("--purge");
-    let output = cmd.output().map_err(|e| e.to_string())?;
+    let output = cmd.output()?;
     if !output.status.success() {
-        return Err(String::from_utf8_lossy(&output.stderr).into_owned());
+        return Err(Error::new(
+            ErrorKind::Other,
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        ));
     }
     return Ok(());
 
@@ -111,63 +121,6 @@ pub fn get_gpg_key(l: &str) -> IOResult<String> {
             format!("Unable to download gpg key: {}", resp.status()),
         ));
     }
-}
-
-pub fn service_stop(name: &str) -> Result<(), String> {
-    let init_daemon = try!(detect_daemon());
-    match init_daemon {
-        Daemon::Systemd => {
-            let mut cmd = Command::new("systemctl");
-            cmd.arg("stop");
-            cmd.arg(name);
-            let output = cmd.output().map_err(|e| e.to_string())?;
-            if !output.status.success() {
-                return Err(String::from_utf8_lossy(&output.stderr).into_owned());
-            }
-            return Ok(());
-        }
-        Daemon::Upstart => {
-            let mut cmd = Command::new("service");
-            cmd.arg("stop");
-            cmd.arg(name);
-            let output = cmd.output().map_err(|e| e.to_string())?;
-            if !output.status.success() {
-                return Err(String::from_utf8_lossy(&output.stderr).into_owned());
-            }
-            return Ok(());
-        }
-        Daemon::Unknown => {
-            return Err("Unknown init system.  Cannot stop service".to_string());
-        }
-    };
-}
-pub fn service_start(name: &str) -> Result<(), String> {
-    let init_daemon = try!(detect_daemon());
-    match init_daemon {
-        Daemon::Systemd => {
-            let mut cmd = Command::new("systemctl");
-            cmd.arg("start");
-            cmd.arg(name);
-            let output = cmd.output().map_err(|e| e.to_string())?;
-            if !output.status.success() {
-                return Err(String::from_utf8_lossy(&output.stderr).into_owned());
-            }
-            return Ok(());
-        }
-        Daemon::Upstart => {
-            let mut cmd = Command::new("service");
-            cmd.arg("start");
-            cmd.arg(name);
-            let output = cmd.output().map_err(|e| e.to_string())?;
-            if !output.status.success() {
-                return Err(String::from_utf8_lossy(&output.stderr).into_owned());
-            }
-            return Ok(());
-        }
-        Daemon::Unknown => {
-            return Err("Unknown init system.  Cannot start service".to_string());
-        }
-    };
 }
 
 pub fn get_candidate_package_version(package_name: &str) -> Result<Version, String> {

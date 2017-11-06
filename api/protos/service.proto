@@ -37,6 +37,13 @@ enum ResultType{
   ERR = 1;
 }
 
+enum CephComponent {
+  Mon = 0;
+  Osd = 1;
+  Rgw = 2;
+  Mds = 3;
+}
+
 enum Op {
   // What version are you currently running
   InstalledVersion = 1;
@@ -50,5 +57,10 @@ enum Op {
 message Operation {
   required Op Op_type = 1;
   // Version to upgrade to
-  optional string version = 2;
+  optional Version version = 2;
+  // used for Upgrade and RunningVersion Op
+  optional CephComponent service = 3;
+  // If apt and reqwest should use a proxy to download files
+  optional string http_proxy = 4;
+  optional string https_proxy = 5;
 }

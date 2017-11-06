@@ -1,3 +1,4 @@
+extern crate api;
 extern crate ceph_rust;
 extern crate chrono;
 extern crate init_daemon;
@@ -9,7 +10,7 @@ extern crate semver;
 extern crate uuid;
 
 use std::fs::{copy, File, metadata, read_dir, remove_file};
-use std::io::{Error, ErrorKind, BufRead, Write};
+use std::io::{Error, ErrorKind, Read, Write};
 use std::io::Result as IOResult;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
@@ -17,6 +18,8 @@ use std::process::Command;
 use std::str::FromStr;
 use std::time::SystemTime;
 
+use self::api::service::Version as ApiVersion;
+use self::api::service::CephComponent;
 use self::ceph_rust::ceph::{connect_to_ceph, ceph_version, disconnect_from_ceph};
 use self::ceph_rust::cmd::{mon_dump, osd_tree};
 use self::init_daemon::{detect_daemon, Daemon};
@@ -26,6 +29,75 @@ use self::semver::Version as SemVer;
 use super::apt;
 use super::debian::version::Version;
 use super::os_type;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CephType {
+    Mon,
+    Osd,
+    Mds,
+    Rgw,
+}
+
+impl From<CephComponent> for CephType {
+    fn from(c: CephComponent) -> Self {
+        match c {
+            CephComponent::Mon => CephType::Mon,
+            CephComponent::Osd => CephType::Osd,
+            CephComponent::Mds => CephType::Mds,
+            CephComponent::Rgw => CephType::Rgw,
+        }
+    }
+}
+
+impl From<CephType> for CephComponent {
+    fn from(c: CephType) -> Self {
+        match c {
+            CephType::Mon => CephComponent::Mon,
+            CephType::Osd => CephComponent::Osd,
+            CephType::Mds => CephComponent::Mds,
+            CephType::Rgw => CephComponent::Rgw,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum CephVersion {
+    Dumpling,
+    Emperor,
+    Firefly,
+    Giant,
+    Hammer,
+    Infernalis,
+    Jewel,
+    Kraken,
+    Luminous,
+    Unknown,
+}
+
+/// A server.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CephServer {
+    pub ip_addr: IpAddr,
+    pub id: String,
+    pub rank: Option<i64>,
+}
+
+#[derive(Debug)]
+pub struct CephNode {
+    pub os_information: os_type::OSInformation,
+}
+
+fn semver_from_debian_version(v: &Version) -> IOResult<SemVer> {
+    let mut buff = String::new();
+    for element in v.clone().upstream_version.elements {
+        buff.push_str(&format!("{}", element.numeric));
+        buff.push_str(&element.alpha);
+    }
+    let vers = semver::Version::parse(&buff).map_err(|e| {
+        Error::new(ErrorKind::Other, e)
+    })?;
+    Ok(vers)
+}
 
 fn backup_conf_files() -> IOResult<Vec<PathBuf>> {
     debug!("Backing up /etc/ceph config files to /tmp");
@@ -49,40 +121,6 @@ fn restore_conf_files(files: &Vec<PathBuf>) -> IOResult<()> {
         copy(f.clone(), format!("/etc/ceph/{}", f.display()))?;
     }
     Ok(())
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum CephType {
-    Mon,
-    Osd,
-    Mds,
-    Rgw,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum CephVersion {
-    Dumpling,
-    Emperor,
-    Firefly,
-    Giant,
-    Hammer,
-    Infernalis,
-    Jewel,
-    Kraken,
-    Luminous,
-}
-
-/// A server.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CephServer {
-    pub ip_addr: IpAddr,
-    pub id: String,
-    pub rank: Option<i64>,
-}
-
-#[derive(Debug)]
-pub struct CephNode {
-    pub os_information: os_type::OSInformation,
 }
 
 pub fn discover_topology() -> Result<Vec<(CephServer, CephType)>, String> {
@@ -120,20 +158,33 @@ pub fn discover_topology() -> Result<Vec<(CephServer, CephType)>, String> {
     Ok(cluster)
 }
 
-fn connect_and_upgrade(servers: Vec<CephServer>, port: u16) -> Result<(), String> {
+fn connect_and_upgrade(
+    servers: Vec<CephServer>,
+    port: u16,
+    new_version: &Version,
+    c: &CephType,
+    http_proxy: Option<&str>,
+    https_proxy: Option<&str>,
+) -> Result<(), String> {
     for s in servers {
         debug!("Connecting to {} to request upgrade", s.ip_addr);
         let mut req_socket = super::connect(&s.ip_addr.to_string(), port).map_err(|e| {
             e.to_string()
         })?;
         debug!("Requesting {} to upgrade", s.ip_addr);
-        match super::upgrade_request(&mut req_socket, "") {
+        match super::upgrade_request(
+            &mut req_socket,
+            super::version_to_protobuf(new_version),
+            c,
+            http_proxy,
+            https_proxy,
+        ) {
             Ok(_) => {
                 info!("Upgrade succeeded.  Proceeding to next");
                 continue;
             }
             Err(e) => {
-                error!("Upgrade failed.  Recording error");
+                error!("Upgrade failed: {}", e);
                 continue;
             }
         };
@@ -146,6 +197,8 @@ pub fn roll_cluster(
     new_version: &Version,
     hosts: Vec<(CephServer, CephType)>,
     port: u16,
+    http_proxy: Option<&str>,
+    https_proxy: Option<&str>,
 ) -> Result<(), String> {
     // Upgrade all mons in the cluster 1 by 1
     // Inspect the cluster health to make sure the mon upgrades were successful
@@ -173,10 +226,38 @@ pub fn roll_cluster(
         .filter(|c| c.1 == CephType::Rgw)
         .map(|c| c.0.clone())
         .collect();
-    connect_and_upgrade(mons, port)?;
-    connect_and_upgrade(osds, port)?;
-    connect_and_upgrade(mds, port)?;
-    connect_and_upgrade(rgws, port)?;
+    connect_and_upgrade(
+        mons,
+        port,
+        new_version,
+        &CephType::Mon,
+        http_proxy,
+        https_proxy,
+    )?;
+    connect_and_upgrade(
+        osds,
+        port,
+        new_version,
+        &CephType::Osd,
+        http_proxy,
+        https_proxy,
+    )?;
+    connect_and_upgrade(
+        mds,
+        port,
+        new_version,
+        &CephType::Mds,
+        http_proxy,
+        https_proxy,
+    )?;
+    connect_and_upgrade(
+        rgws,
+        port,
+        new_version,
+        &CephType::Rgw,
+        http_proxy,
+        https_proxy,
+    )?;
     return Ok(());
 }
 
@@ -186,42 +267,56 @@ impl CephNode {
     pub fn new() -> Self {
         CephNode { os_information: os_type::current_platform() }
     }
-    pub fn upgrade_node(&self, version: &str) -> Result<(), String> {
+
+    pub fn upgrade_node(
+        &self,
+        version: &ApiVersion,
+        c: CephComponent,
+        http_proxy: Option<&str>,
+        https_proxy: Option<&str>,
+    ) -> Result<(), String> {
         debug!(
-            "Upgrading from {} to {}",
-            ceph_version("/var/run/ceph/...").unwrap_or("".into()),
+            "Upgrading from {:?} to {:?}",
+            apt::get_installed_package_version("ceph")?,
             version
         );
+        let backed_files = backup_conf_files().map_err(|e| e.to_string())?;
+
+        //TODO Install new sources if needed
+        self.upgrade(http_proxy, https_proxy).map_err(
+            |e| e.to_string(),
+        )?;
+        restore_conf_files(&backed_files).map_err(|e| e.to_string())?;
+        match c {
+            CephComponent::Mon => {
+                self.restart_mon().map_err(|e| e.to_string())?;
+            }
+            CephComponent::Osd => {
+                self.upgrade_osd(version).map_err(|e| e.to_string())?;
+            }
+            CephComponent::Rgw => {
+                self.restart_rgw().map_err(|e| e.to_string())?;
+            }
+            CephComponent::Mds => {
+                self.restart_mds().map_err(|e| e.to_string())?;
+            }
+        };
+
         return Ok(());
     }
-    fn upgrade_osd(&self, version: String) -> IOResult<()> {
-        /*
-echo "Stopping osds"
-systemctl stop ceph-osd.target
-wget -q -O- 'https://download.ceph.com/keys/release.asc' | sudo apt-key add -
 
-echo "Setting ceph upstream apt source"
-echo "deb https://download.ceph.com/debian-jewel/ xenial main" >> /etc/apt/sources.list
-echo "# deb-src https://download.ceph.com/debian-jewel/ xenial main" >> /etc/apt/sources.list
+    fn upgrade(&self, http_proxy: Option<&str>, https_proxy: Option<&str>) -> IOResult<()> {
+        //basic upgrade things that all nodes need to do
 
-apt-get update
-echo "Removing ceph"
-apt-get install -y ceph
-echo "Starting osds"
-systemctl start ceph-osd.target
-*/
-        debug!(
-            "Upgrading from {} to {}",
-            ceph_version("/var/run/ceph/...").unwrap_or("".into()),
-            version
-        );
         // install apt proxy if needed
-        // install ceph sources if needed
-        // apt-get update
-        // stop osd
-        self.stop_osd(0)?;
-        //backup ceph conf files
-        // Check if these packages exist and remove all
+        if let Some(http_proxy) = http_proxy {
+            debug!("apt http_proxy set: {}", http_proxy);
+            if let Some(https_proxy) = https_proxy {
+                debug!("apt https_proxy set: {}", https_proxy);
+                apt::ensure_proxy(http_proxy, https_proxy)?;
+            }
+        }
+        apt::apt_update()?;
         apt::apt_remove(vec![
             "ceph",
             "ceph-base",
@@ -239,23 +334,127 @@ systemctl start ceph-osd.target
             "libradosstriper1",
             "librados2",
         ]).map_err(|e| Error::new(ErrorKind::Other, e))?;
-        self.disable_osd(0)?;
-        //
+
         apt::apt_install(vec!["ceph"]).map_err(|e| {
             Error::new(ErrorKind::Other, e)
         })?;
-        update_owner(&Path::new("/var/lib/ceph/osd-?"), true)?;
-        self.enable_osd(0)?;
-        self.start_osd(0)?;
+        Ok(())
+    }
 
-        return Ok(());
+    fn restart_service(&self, ceph_type: CephType) -> IOResult<()> {
+        let init_daemon = detect_daemon().map_err(|e| Error::new(ErrorKind::Other, e))?;
+        match init_daemon {
+            Daemon::Systemd => {
+                let mut c = Command::new("systemctl");
+                c.arg("restart");
+                match ceph_type {
+                    CephType::Mon => c.arg("ceph-mon.target"),
+                    CephType::Mds => c.arg("ceph-mds.target"),
+                    CephType::Rgw => c.arg("ceph-rgw.target"),
+                    _ => c.arg("ceph-mon.target"),
+                };
+                let output = c.output()?;
+                if !output.status.success() {
+                    return Err(Error::last_os_error());
+                }
+            }
+            _ => {
+                let mut c = Command::new("systemctl");
+                c.arg("restart");
+                match ceph_type {
+                    CephType::Mon => c.arg("ceph-mon-all"),
+                    CephType::Mds => c.arg("ceph-mds-all"),
+                    CephType::Rgw => c.arg("ceph-rgw-all"),
+                    _ => c.arg("ceph-mon-all"),
+                };
+                let output = c.output()?;
+                if !output.status.success() {
+                    return Err(Error::last_os_error());
+                }
+            }
+        };
+        Ok(())
+    }
+
+    fn restart_mon(&self) -> IOResult<()> {
+        debug!("Restarting Mon");
+        self.restart_service(CephType::Mon)?;
+        Ok(())
+    }
+
+    fn restart_rgw(&self) -> IOResult<()> {
+        debug!("Restarting Rgw");
+        self.restart_service(CephType::Rgw)?;
+        Ok(())
+    }
+
+    fn restart_mds(&self) -> IOResult<()> {
+        debug!("Restarting Mds");
+        self.restart_service(CephType::Mds)?;
+        Ok(())
+    }
+    fn upgrade_osd(&self, version: &ApiVersion) -> IOResult<()> {
+        // ask ceph for all the osds that this host owns.
+        let hostname = {
+            let mut f = File::open("/etc/hostname")?;
+            let mut buff = String::new();
+            f.read_to_string(&mut buff)?;
+            buff
+        };
+        let h = connect_to_ceph("admin", "/etc/ceph/ceph.conf").map_err(
+            |e| {
+                Error::new(ErrorKind::Other, e)
+            },
+        )?;
+        let osd_tree = ceph_rust::cmd::osd_tree(h).map_err(|e| {
+            Error::new(ErrorKind::Other, e)
+        })?;
+        // This should filter down to 1 node
+        let hosts: Vec<&ceph_rust::cmd::CrushNode> = osd_tree
+            .nodes
+            .iter()
+            .filter(|n| n.crush_type == "host" && n.name == hostname)
+            .collect();
+
+        match hosts.first() {
+            Some(host) => {
+                if let Some(ref children) = host.children {
+                    debug!("Found osds: {:?} for host: {}", children, hostname);
+                    for child in children {
+                        // stop osd
+                        self.stop_osd(*child)?;
+                        // Check if these packages exist and remove all
+                        self.disable_osd(0)?;
+
+                        // Only if we're going from CephVersion::Hammer -> CephVersion::Jewel
+                        // Make sure the correct user owns the file.
+                        update_owner(&Path::new(&format!("/var/lib/ceph/osd-{}", child)), true)?;
+                        self.enable_osd(*child)?;
+                        self.start_osd(*child)?;
+                    }
+                }
+                Ok(())
+            }
+            None => {
+                error!(
+                    "Host: {} not found in osd tree.  Unable to determine which osds to restart",
+                    hostname
+                );
+                Err(Error::new(
+                    ErrorKind::Other,
+                    format!(
+                        "No hostname {} found in osd tree.  Can't restart osds",
+                        hostname
+                    ),
+                ))
+            }
+        }
     }
 
     ///Stops the specified OSD number.
-    fn stop_osd(&self, osd_num: u64) -> IOResult<()> {
-        let init_daemon = detect_daemon().map_err(|e| {
-            ::std::io::Error::new(::std::io::ErrorKind::Other, e)
-        })?;
+    fn stop_osd(&self, osd_num: i64) -> IOResult<()> {
+        debug!("Stopping osd: {}", osd_num);
+        let init_daemon = detect_daemon().map_err(|e| Error::new(ErrorKind::Other, e))?;
         match init_daemon {
             Daemon::Systemd => {
                 Command::new("systemctl")
@@ -273,11 +472,11 @@ systemctl start ceph-osd.target
         };
         Ok(())
     }
+
     ///Starts the specified OSD number.
-    fn start_osd(&self, osd_num: u64) -> IOResult<()> {
-        let init_daemon = detect_daemon().map_err(|e| {
-            ::std::io::Error::new(::std::io::ErrorKind::Other, e)
-        })?;
+    fn start_osd(&self, osd_num: i64) -> IOResult<()> {
+        debug!("Starting osd: {}", osd_num);
+        let init_daemon = detect_daemon().map_err(|e| Error::new(ErrorKind::Other, e))?;
         match init_daemon {
             Daemon::Systemd => {
                 Command::new("systemctl")
@@ -301,9 +500,8 @@ systemctl start ceph-osd.target
     ///this method cannot make any guarantees that the specified osd cannot be
     ///started manually.
     fn disable_osd(&self, osd_num: u64) -> IOResult<()> {
-        let init_daemon = detect_daemon().map_err(|e| {
-            ::std::io::Error::new(::std::io::ErrorKind::Other, e)
-        })?;
+        debug!("Disabling osd: {}", osd_num);
+        let init_daemon = detect_daemon().map_err(|e| Error::new(ErrorKind::Other, e))?;
         match init_daemon {
             // When running under systemd, the individual ceph-osd daemons run as
             // templated units and can be directly addressed by referring to the
@@ -317,53 +515,69 @@ systemctl start ceph-osd.target
                 let output = Command::new("systemctl")
                     .args(&["disable", &format!("ceph-osd@{}", osd_num)])
                     .output()?;
+                if !output.status.success() {
+                    return Err(Error::last_os_error());
+                }
             }
-            _ => {}
+            Daemon::Upstart => {
+                // Neither upstart nor the ceph-osd upstart script provides for
+                // disabling the starting of an OSD automatically. The specific OSD
+                // cannot be prevented from running manually, however it can be
+                // prevented from running automatically on reboot by removing the
+                // 'ready' file in the OSD's root directory. This is due to the
+                // ceph-osd-all upstart script checking for the presence of this file
+                // before starting the OSD.
+                let ready_file: PathBuf = ["/var/lib/ceph", &format!("ceph-{}", osd_num), "ready"]
+                    .iter()
+                    .collect();
+                if ready_file.exists() {
+                    remove_file(ready_file)?;
+                }
+            }
+            _ => {
+                return Err(Error::new(
+                    ErrorKind::Other,
+                    "Unable to detect init daemon.  Cannot disable osd",
+                ));
+            }
         };
-        // Neither upstart nor the ceph-osd upstart script provides for
-        // disabling the starting of an OSD automatically. The specific OSD
-        // cannot be prevented from running manually, however it can be
-        // prevented from running automatically on reboot by removing the
-        // 'ready' file in the OSD's root directory. This is due to the
-        // ceph-osd-all upstart script checking for the presence of this file
-        // before starting the OSD.
-        let ready_file: PathBuf = ["/var/lib/ceph", &format!("ceph-{}", osd_num), "ready"]
-            .iter()
-            .collect();
-        if ready_file.exists() {
-            remove_file(ready_file)?;
-        }
+
         Ok(())
     }
     ///Enables the specified OSD number.
     ///Ensures that the specified osd_num will be enabled and ready to start
     ///automatically in the event of a reboot.
     ///osd_num: the osd id which should be enabled.
-    fn enable_osd(&self, osd_num: u64) -> IOResult<()> {
-        let init_daemon = detect_daemon().map_err(|e| {
-            ::std::io::Error::new(::std::io::ErrorKind::Other, e)
-        })?;
+    fn enable_osd(&self, osd_num: i64) -> IOResult<()> {
+        debug!("Enabling osd: {}", osd_num);
+        let init_daemon = detect_daemon().map_err(|e| Error::new(ErrorKind::Other, e))?;
         match init_daemon {
             Daemon::Systemd => {
                 let output = Command::new("systemctl")
                     .args(&["enable", &format!("ceph-osd@{}", osd_num)])
                     .output()?;
+                if !output.status.success() {
+                    return Err(Error::last_os_error());
+                }
             }
-            _ => {}
+            Daemon::Upstart => {
+                // When running on upstart, the OSDs are started via the ceph-osd-all
+                // upstart script which will only start the osd if it has a 'ready'
+                // file. Make sure that file exists.
+                let ready_file_path: PathBuf =
+                    ["/var/lib/ceph", &format!("ceph-{}", osd_num), "ready"]
+                        .iter()
+                        .collect();
+                let mut file = File::create(&ready_file_path)?;
+                file.write_all(b"ready")?;
+            }
+            _ => {
+                return Err(Error::new(
+                    ErrorKind::Other,
+                    "Unable to detect init daemon.  Cannot enable osd",
+                ));
+            }
         };
-        // When running on upstart, the OSDs are started via the ceph-osd-all
-        // upstart script which will only start the osd if it has a 'ready'
-        // file. Make sure that file exists.
-        let ready_file_path: PathBuf = ["/var/lib/ceph", &format!("ceph-{}", osd_num), "ready"]
-            .iter()
-            .collect();
-        let mut file = File::create(&ready_file_path)?;
-        file.write_all(b"ready")?;
-
-        // Make sure the correct user owns the file. It shouldn't be necessary
-        // as the upstart script should run with root privileges, but its better
-        // to have all the files matching ownership.
-        update_owner(&ready_file_path, true)?;
         Ok(())
     }
 
@@ -403,28 +617,28 @@ systemctl start ceph-osd.target
 }
 
 // Search around for a ceph socket
-fn find_socket(c: CephType) -> IOResult<PathBuf> {
+fn find_socket(c: &CephType) -> IOResult<PathBuf> {
     debug!("Opening /var/run/ceph to find sockets to connect to");
     let p = Path::new("/var/run/ceph");
     for entry in p.read_dir()? {
         if let Ok(entry) = entry {
             match c {
-                CephType::Mon => {
+                &CephType::Mon => {
                     if entry.file_name().to_string_lossy().starts_with("ceph-mon") {
                         return Ok(entry.path());
                     }
                 }
-                CephType::Osd => {
+                &CephType::Osd => {
                     if entry.file_name().to_string_lossy().starts_with("ceph-osd") {
                         return Ok(entry.path());
                     }
                 }
-                CephType::Mds => {
+                &CephType::Mds => {
                     if entry.file_name().to_string_lossy().starts_with("ceph-mds") {
                         return Ok(entry.path());
                     }
                 }
-                CephType::Rgw => {
+                &CephType::Rgw => {
                     if entry.file_name().to_string_lossy().starts_with("ceph-rgw") {
                         return Ok(entry.path());
                     }
@@ -436,7 +650,7 @@ fn find_socket(c: CephType) -> IOResult<PathBuf> {
 }
 
 // Get the running version of a ceph type ie Mon, Osd, etc
-pub fn get_running_version(c: CephType) -> IOResult<SemVer> {
+pub fn get_running_version(c: &CephType) -> IOResult<SemVer> {
     let socket = find_socket(c).map_err(|e| Error::new(ErrorKind::Other, e))?;
     let v = match ceph_version(&format!("/var/run/ceph/{}", socket.display())) {
         Some(v) => v,
@@ -451,49 +665,45 @@ pub fn get_running_version(c: CephType) -> IOResult<SemVer> {
     Ok(ceph_version)
 }
 
-fn ceph_release(socket: &str) -> Option<CephVersion> {
-    let v = match ceph_version(&format!("/var/run/ceph/{}", socket)) {
-        Some(v) => v,
-        None => {
-            error!("Unable to discover ceph version.  Can't discern correct user");
-            return None;
-        }
-    };
-    let ceph_version = match SemVer::parse(&v) {
-        Ok(v) => v,
-        Err(e) => {
-            error!("Semver failed to parse ceph version: {}", &v);
-            return None;
-        }
-    };
+fn ceph_release() -> IOResult<CephVersion> {
+    let v = apt::get_installed_package_version("ceph").map_err(|e| {
+        Error::new(ErrorKind::Other, e)
+    })?;
+    let ceph_version = semver_from_debian_version(&v)?;
     match ceph_version.major {
         0 => {
             match ceph_version.minor {
-                67 => Some(CephVersion::Dumpling),
-                72 => Some(CephVersion::Emperor),
-                80 => Some(CephVersion::Firefly),
-                87 => Some(CephVersion::Giant),
-                94 => Some(CephVersion::Hammer),
-                _ => None,
+                67 => Ok(CephVersion::Dumpling),
+                72 => Ok(CephVersion::Emperor),
+                80 => Ok(CephVersion::Firefly),
+                87 => Ok(CephVersion::Giant),
+                94 => Ok(CephVersion::Hammer),
+                _ => Ok(CephVersion::Unknown),
             }
         }
-        9 => Some(CephVersion::Infernalis),
-        10 => Some(CephVersion::Jewel),
-        11 => Some(CephVersion::Kraken),
-        12 => Some(CephVersion::Luminous),
-        _ => None,
+        9 => Ok(CephVersion::Infernalis),
+        10 => Ok(CephVersion::Jewel),
+        11 => Ok(CephVersion::Kraken),
+        12 => Ok(CephVersion::Luminous),
+        _ => Ok(CephVersion::Unknown),
     }
 }
 
-fn ceph_user(c: CephType) -> Result<String, String> {
-    let socket = match c {
-        CephType::Mds => "",
-        CephType::Mon => "",
-        CephType::Osd => "",
-        CephType::Rgw => "",
-    };
-    let release = ceph_release("");
-    Ok("ceph".into())
+fn ceph_user(c: CephVersion) -> String {
+    match c {
+        CephVersion::Dumpling => "root".into(),
+        CephVersion::Emperor => "root".into(),
+        CephVersion::Firefly => "root".into(),
+        CephVersion::Giant => "root".into(),
+        CephVersion::Hammer => "root".into(),
+        CephVersion::Infernalis => "ceph".into(),
+        CephVersion::Jewel => "ceph".into(),
+        CephVersion::Kraken => "ceph".into(),
+        CephVersion::Luminous => "ceph".into(),
+
+        //TODO what should we return here?.  I can't figure out what the ceph version is
+        CephVersion::Unknown => "root".into(),
+    }
 }
 
 ///Changes the ownership of the specified path.
@@ -502,7 +712,8 @@ fn ceph_user(c: CephType) -> Result<String, String> {
 ///so this method will issue a set_status for any changes of ownership which
 ///recurses into directory structures.
 fn update_owner(path: &Path, recurse_dirs: bool) -> IOResult<()> {
-    let user = ceph_user(CephType::Mon).unwrap();
+    let release = ceph_release()?;
+    let user = ceph_user(release);
     let user_group = format!("{ceph_user}:{ceph_user}", ceph_user = user);
     debug!("Changing ownership of {:?} to {}", path, user_group);
     let mut cmd: Vec<String> = vec![
