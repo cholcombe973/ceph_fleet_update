@@ -12,10 +12,8 @@ extern crate uuid;
 use std::fs::{copy, File, metadata, read_dir, remove_file};
 use std::io::{Error, ErrorKind, Read, Write};
 use std::io::Result as IOResult;
-use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::str::FromStr;
 use std::time::SystemTime;
 
 use self::api::service::Version as ApiVersion;
@@ -77,7 +75,7 @@ enum CephVersion {
 /// A server.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CephServer {
-    pub ip_addr: IpAddr,
+    pub addr: String,
     pub id: String,
     pub rank: Option<i64>,
 }
@@ -135,8 +133,7 @@ pub fn discover_topology() -> Result<Vec<(CephServer, CephType)>, String> {
     for mon in mon_info.mons {
         cluster.push((
             CephServer {
-                ip_addr: IpAddr::from_str(mon.addr.split("").next().unwrap())
-                    .map_err(|e| e.to_string())?,
+                addr: mon.addr.split("").next().unwrap().to_string(),
                 id: mon.name,
                 rank: Some(mon.rank),
             },
@@ -147,8 +144,8 @@ pub fn discover_topology() -> Result<Vec<(CephServer, CephType)>, String> {
     for osd in osd_info.nodes {
         cluster.push((
             CephServer {
-                ip_addr: IpAddr::from_str("").map_err(|e| e.to_string())?,
-                id: "".to_string(),
+                addr: osd.name,
+                id: osd.id.to_string(),
                 rank: None,
             },
             CephType::Osd,
@@ -165,19 +162,21 @@ fn connect_and_upgrade(
     c: &CephType,
     http_proxy: Option<&str>,
     https_proxy: Option<&str>,
+    gpg_key: Option<&str>,
+    apt_source: Option<&str>,
 ) -> Result<(), String> {
     for s in servers {
-        debug!("Connecting to {} to request upgrade", s.ip_addr);
-        let mut req_socket = super::connect(&s.ip_addr.to_string(), port).map_err(|e| {
-            e.to_string()
-        })?;
-        debug!("Requesting {} to upgrade", s.ip_addr);
+        debug!("Connecting to {} to request upgrade", s.addr);
+        let mut req_socket = super::connect(&s.addr, port).map_err(|e| e.to_string())?;
+        debug!("Requesting {} to upgrade", s.addr);
         match super::upgrade_request(
             &mut req_socket,
             super::version_to_protobuf(new_version),
             c,
             http_proxy,
             https_proxy,
+            gpg_key,
+            apt_source,
         ) {
             Ok(_) => {
                 info!("Upgrade succeeded.  Proceeding to next");
@@ -199,6 +198,8 @@ pub fn roll_cluster(
     port: u16,
     http_proxy: Option<&str>,
     https_proxy: Option<&str>,
+    gpg_key: Option<&str>,
+    apt_source: Option<&str>,
 ) -> Result<(), String> {
     // Upgrade all mons in the cluster 1 by 1
     // Inspect the cluster health to make sure the mon upgrades were successful
@@ -233,6 +234,8 @@ pub fn roll_cluster(
         &CephType::Mon,
         http_proxy,
         https_proxy,
+        gpg_key,
+        apt_source,
     )?;
     connect_and_upgrade(
         osds,
@@ -241,6 +244,8 @@ pub fn roll_cluster(
         &CephType::Osd,
         http_proxy,
         https_proxy,
+        gpg_key,
+        apt_source,
     )?;
     connect_and_upgrade(
         mds,
@@ -249,6 +254,8 @@ pub fn roll_cluster(
         &CephType::Mds,
         http_proxy,
         https_proxy,
+        gpg_key,
+        apt_source,
     )?;
     connect_and_upgrade(
         rgws,
@@ -257,6 +264,8 @@ pub fn roll_cluster(
         &CephType::Rgw,
         http_proxy,
         https_proxy,
+        gpg_key,
+        apt_source,
     )?;
     return Ok(());
 }
@@ -268,12 +277,15 @@ impl CephNode {
         CephNode { os_information: os_type::current_platform() }
     }
 
+    /// Main entry point for node upgrade procedures
     pub fn upgrade_node(
         &self,
         version: &ApiVersion,
         c: CephComponent,
         http_proxy: Option<&str>,
         https_proxy: Option<&str>,
+        gpg_key: Option<&str>,
+        apt_source: Option<&str>,
     ) -> Result<(), String> {
         debug!(
             "Upgrading from {:?} to {:?}",
@@ -283,6 +295,12 @@ impl CephNode {
         let backed_files = backup_conf_files().map_err(|e| e.to_string())?;
 
         //TODO Install new sources if needed
+        if let Some(gpg_key) = gpg_key {
+            apt::get_gpg_key(gpg_key).map_err(|e| e.to_string())?;
+        }
+        if let Some(apt_source) = apt_source {
+            apt::add_source(apt_source).map_err(|e| e.to_string())?;
+        }
         self.upgrade(http_proxy, https_proxy).map_err(
             |e| e.to_string(),
         )?;

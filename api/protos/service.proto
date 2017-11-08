@@ -63,4 +63,8 @@ message Operation {
   // If apt and reqwest should use a proxy to download files
   optional string http_proxy = 4;
   optional string https_proxy = 5;
+  // URL to the repository key
+  optional string gpg_key = 6;
+  // apt source line to use
+  optional string apt_source = 7;
 }

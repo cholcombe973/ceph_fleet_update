@@ -115,7 +115,29 @@ fn listen(port: u16) -> ZmqResult<()> {
                         None
                     }
                 };
-                match handle_upgrade(&mut responder, version, service, http_proxy, https_proxy) {
+                let gpg_key: Option<&str> = {
+                    if operation.has_gpg_key() {
+                        Some(operation.get_gpg_key())
+                    } else {
+                        None
+                    }
+                };
+                let apt_source: Option<&str> = {
+                    if operation.has_apt_source() {
+                        Some(operation.get_apt_source())
+                    } else {
+                        None
+                    }
+                };
+                match handle_upgrade(
+                    &mut responder,
+                    version,
+                    service,
+                    http_proxy,
+                    https_proxy,
+                    gpg_key,
+                    apt_source,
+                ) {
                     Ok(_) => {
                         info!("Upgrade successful");
                     }
@@ -270,11 +292,20 @@ fn handle_upgrade(
     service: CephComponent,
     http_proxy: Option<&str>,
     https_proxy: Option<&str>,
+    gpg_key: Option<&str>,
+    apt_source: Option<&str>,
 ) -> IOResult<()> {
     // Upgrade to a new release
     let mut result = OpResult::new();
     let c = CephNode::new();
-    match c.upgrade_node(version, service, http_proxy, https_proxy) {
+    match c.upgrade_node(
+        version,
+        service,
+        http_proxy,
+        https_proxy,
+        gpg_key,
+        apt_source,
+    ) {
         Ok(_) => {
             result.set_result(ResultType::OK);
             let encoded = result.write_to_bytes().map_err(
@@ -384,6 +415,8 @@ fn upgrade_request(
     ceph_type: &CephType,
     http_proxy: Option<&str>,
     https_proxy: Option<&str>,
+    gpg_key: Option<&str>,
+    apt_source: Option<&str>,
 ) -> Result<(), String> {
     let mut o = Operation::new();
     debug!("Creating upgrade operation request");
@@ -396,6 +429,12 @@ fn upgrade_request(
     }
     if let Some(https_proxy) = https_proxy {
         o.set_https_proxy(https_proxy.into());
+    }
+    if let Some(gpg_key) = gpg_key {
+        o.set_gpg_key(gpg_key.into());
+    }
+    if let Some(apt_source) = apt_source {
+        o.set_apt_source(apt_source.into());
     }
 
     let encoded = o.write_to_bytes().unwrap();
@@ -532,6 +571,20 @@ fn main() {
                 .takes_value(true)
                 .required(true),
         )
+        .arg(
+            Arg::with_name("repo_source")
+                .help("Apt source for new repository if needed")
+                .long("reposource")
+                .takes_value(true)
+                .required(false),
+        )
+        .arg(
+            Arg::with_name("repo_key")
+                .help("GPG key for the repository")
+                .long("repokey")
+                .takes_value(true)
+                .required(false),
+        )
         .arg(Arg::with_name("v").short("v").multiple(true).help(
             "Sets the level of verbosity",
         ))
@@ -551,6 +604,8 @@ fn main() {
     ]);
     let http_proxy: Option<&str> = matches.value_of("http_proxy");
     let https_proxy: Option<&str> = matches.value_of("https_proxy");
+    let gpg_key: Option<&str> = matches.value_of("repo_key");
+    let apt_source: Option<&str> = matches.value_of("repo_source");
     let port = u16::from_str(matches.value_of("port").unwrap()).unwrap();
     let v = DebianVersion::parse(matches.value_of("version").unwrap()).unwrap();
     if matches.is_present("leader") {
@@ -567,7 +622,15 @@ fn main() {
             error!("Uploading and starting binaries failed: {:?}. exiting", e);
             return;
         }
-        match ceph_upgrade::roll_cluster(&v, cluster_hosts, port, http_proxy, https_proxy) {
+        match ceph_upgrade::roll_cluster(
+            &v,
+            cluster_hosts,
+            port,
+            http_proxy,
+            https_proxy,
+            gpg_key,
+            apt_source,
+        ) {
             Ok(_) => {
                 info!("Cluster rolling upgrade completed");
             }

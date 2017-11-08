@@ -5,7 +5,7 @@ use std::fs::File;
 use std::io::{Error, ErrorKind, Read, Write};
 use std::io::Result as IOResult;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use self::apt_pkg_native::Cache;
 use super::debian::version::Version;
@@ -109,12 +109,25 @@ pub fn ensure_proxy(http_endpoint: &str, https_endpoint: &str) -> IOResult<()> {
 }
 
 // Get the GPG key for the ceph repo
-pub fn get_gpg_key(l: &str) -> IOResult<String> {
+pub fn get_gpg_key(l: &str) -> IOResult<()> {
     let mut resp = reqwest::get(l).map_err(|e| Error::new(ErrorKind::Other, e))?;
     if resp.status().is_success() {
         let mut content = String::new();
         resp.read_to_string(&mut content)?;
-        return Ok(content);
+        let child = Command::new("apt-key")
+            .stdin(Stdio::piped())
+            .args(&["add", "-"])
+            .spawn()?;
+        if let Some(mut stdin) = child.stdin {
+            stdin.write(&content.as_bytes())?;
+            return Ok(());
+        } else {
+            return Err(Error::new(
+                ErrorKind::Other,
+                "Stdin to apt-key failed.  Unable to save gpg key"
+                    .to_string(),
+            ));
+        }
     } else {
         return Err(Error::new(
             ErrorKind::Other,
