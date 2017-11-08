@@ -2,6 +2,7 @@
 name = "ceph_fleet_update"
 version = "0.1.0"
 authors = ["Chris Holcombe <xfactor973@gmail.com>"]
+license = "MIT"
 
 [dependencies]
 api = { path = "api" }
