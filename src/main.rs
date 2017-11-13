@@ -15,16 +15,18 @@ extern crate zmq;
 mod apt;
 mod ceph_upgrade;
 
-use std::fs::File;
+use std::ffi::OsStr;
 use std::io::{Error, ErrorKind};
 use std::io::Result as IOResult;
+use std::path::PathBuf;
 use std::process::Command;
 use std::str::FromStr;
 use std::thread;
+use std::time;
 use std::time::Duration;
 
-use api::service::{CephComponent, Op, Operation, ResultType, OpResult, Version, VersionElement,
-                   VersionPart, VersionResult};
+use api::service::{CephComponent, CephServer, HostResult, Op, Operation, ResultType, OpResult,
+                   Version, VersionElement, VersionPart, VersionResult};
 use ceph_upgrade::{get_running_version, CephType, CephNode};
 use clap::{Arg, App};
 use debian::version::Version as DebianVersion;
@@ -32,7 +34,7 @@ use protobuf::Message as ProtobufMsg;
 use protobuf::core::parse_from_bytes;
 use protobuf::repeated::RepeatedField;
 use semver::Version as SemVer;
-use simplelog::{Config, CombinedLogger, TermLogger, WriteLogger};
+use simplelog::{Config, SimpleLogger};
 use slack_hook::{Slack, PayloadBuilder};
 use zmq::{Message, Socket};
 use zmq::Result as ZmqResult;
@@ -42,7 +44,14 @@ use zmq::Result as ZmqResult;
           2. use as a library
           3. Email notifications
 */
-fn listen(port: u16) -> ZmqResult<()> {
+fn listen(
+    port: u16,
+    version: &DebianVersion,
+    http_proxy: Option<&str>,
+    https_proxy: Option<&str>,
+    gpg_key: Option<&str>,
+    apt_source: Option<&str>,
+) -> ZmqResult<()> {
     debug!("Starting zmq listener with version({:?})", zmq::version());
     let context = zmq::Context::new();
     let mut responder = context.socket(zmq::REP)?;
@@ -64,15 +73,29 @@ fn listen(port: u16) -> ZmqResult<()> {
 
         debug!("Operation requested: {:?}", operation.get_Op_type());
         match operation.get_Op_type() {
+            Op::BecomeLeader => {
+                if let Err(e) = handle_become_leader(
+                    &mut responder,
+                    version,
+                    port,
+                    http_proxy,
+                    https_proxy,
+                    gpg_key,
+                    apt_source,
+                )
+                {
+                    error!("BecomeLeader error: {:?}", e);
+                }
+            }
+            Op::ListHosts => {
+                if let Err(e) = handle_list_hosts(&mut responder) {
+                    error!("ListHosts error: {:?}", e);
+                }
+            }
             Op::InstalledVersion => {
-                match handle_get_installed_version(&mut responder) {
-                    Ok(_) => {
-                        info!("Get installed version successful");
-                    }
-                    Err(e) => {
-                        error!("Get installed version error: {:?}", e);
-                    }
-                };
+                if let Err(e) = handle_get_installed_version(&mut responder) {
+                    error!("Get installed version error: {:?}", e);
+                }
             }
             Op::RunningVersion => {
                 if !operation.has_service() {
@@ -80,14 +103,13 @@ fn listen(port: u16) -> ZmqResult<()> {
                     continue;
                 }
                 let service = operation.get_service();
-                match handle_get_running_version(&mut responder, CephType::from(service)) {
-                    Ok(_) => {
-                        info!("Get running version successful");
-                    }
-                    Err(e) => {
-                        error!("Get running version error: {:?}", e);
-                    }
-                };
+                if let Err(e) = handle_get_running_version(
+                    &mut responder,
+                    CephType::from(service),
+                )
+                {
+                    error!("Get running version error: {:?}", e);
+                }
 
             }
             Op::Upgrade => {
@@ -129,7 +151,7 @@ fn listen(port: u16) -> ZmqResult<()> {
                         None
                     }
                 };
-                match handle_upgrade(
+                if let Err(e) = handle_upgrade(
                     &mut responder,
                     version,
                     service,
@@ -137,14 +159,10 @@ fn listen(port: u16) -> ZmqResult<()> {
                     https_proxy,
                     gpg_key,
                     apt_source,
-                ) {
-                    Ok(_) => {
-                        info!("Upgrade successful");
-                    }
-                    Err(e) => {
-                        error!("Upgrade error: {:?}", e);
-                    }
-                };
+                )
+                {
+                    error!("Upgrade error: {:?}", e);
+                }
             }
             Op::Stop => {
                 // Exit
@@ -177,7 +195,7 @@ fn notify_slack(
     Ok(())
 }
 
-fn semver_to_protobuf(v: SemVer) -> Version {
+fn semver_to_protobuf(v: &SemVer) -> Version {
     let mut version_msg = Version::new();
     let mut upstream = VersionPart::new();
 
@@ -242,6 +260,92 @@ pub fn version_to_protobuf(v: &DebianVersion) -> Version {
     version_msg
 }
 
+fn handle_become_leader(
+    s: &mut Socket,
+    version: &DebianVersion,
+    port: u16,
+    http_proxy: Option<&str>,
+    https_proxy: Option<&str>,
+    gpg_key: Option<&str>,
+    apt_source: Option<&str>,
+) -> IOResult<()> {
+    let mut result = OpResult::new();
+    result.set_result(ResultType::OK);
+    let encoded = result.write_to_bytes().map_err(
+        |e| Error::new(ErrorKind::Other, e),
+    )?;
+    let msg = Message::from_slice(&encoded)?;
+    debug!("Responding to client with msg len: {}", msg.len());
+    s.send_msg(msg, 0)?;
+
+    info!("I am the leader");
+    let cluster_hosts = match ceph_upgrade::discover_topology() {
+        Ok(hosts) => hosts,
+        Err(e) => {
+            error!("Discovering the cluster topology failed: {:?}", e);
+            return Err(Error::new(
+                ErrorKind::Other,
+                "Discover cluster topology failed",
+            ));
+        }
+    };
+    info!("Cluster hosts: {:?}", cluster_hosts);
+    match ceph_upgrade::roll_cluster(
+        &version,
+        cluster_hosts,
+        port,
+        http_proxy,
+        https_proxy,
+        gpg_key,
+        apt_source,
+    ) {
+        Ok(_) => {
+            info!("Cluster rolling upgrade completed");
+        }
+        Err(e) => {
+            error!("Cluster rolling upgrade failed: {:?}", e);
+            return Err(Error::new(ErrorKind::Other, "Rolling upgrade failed"));
+        }
+    }
+    Ok(())
+}
+
+fn handle_list_hosts(s: &mut Socket) -> IOResult<()> {
+    let mut result = HostResult::new();
+    match ceph_upgrade::discover_topology() {
+        Ok(hosts) => {
+            result.set_result(ResultType::OK);
+            let host_list: RepeatedField<CephServer> = RepeatedField::from_vec(
+                hosts
+                    .iter()
+                    .map(|h| {
+                        let mut c = CephServer::new();
+                        c.set_addr(h.0.addr.clone());
+                        c.set_id(h.0.id.clone());
+                        if let Some(rank) = h.0.rank {
+                            c.set_rank(rank.clone());
+                        }
+                        c.set_component(CephComponent::from(h.1.clone()));
+                        c
+                    })
+                    .collect(),
+            );
+            result.set_hosts(host_list);
+        }
+        Err(e) => {
+            result.set_result(ResultType::ERR);
+            result.set_error_msg(e.to_string());
+        }
+    };
+    let encoded = result.write_to_bytes().map_err(
+        |e| Error::new(ErrorKind::Other, e),
+    )?;
+    let msg = Message::from_slice(&encoded)?;
+    debug!("Responding to client with msg len: {}", msg.len());
+    s.send_msg(msg, 0)?;
+    Ok(())
+}
+
 fn handle_get_installed_version(s: &mut Socket) -> IOResult<()> {
     let mut result = VersionResult::new();
     match apt::get_installed_package_version("ceph") {
@@ -249,18 +353,18 @@ fn handle_get_installed_version(s: &mut Socket) -> IOResult<()> {
             result.set_result(ResultType::OK);
             let v = version_to_protobuf(&vers);
             result.set_version(v);
-            let encoded = result.write_to_bytes().map_err(
-                |e| Error::new(ErrorKind::Other, e),
-            )?;
-            let msg = Message::from_slice(&encoded)?;
-            debug!("Responding to client with msg len: {}", msg.len());
-            s.send_msg(msg, 0)?;
         }
         Err(e) => {
             result.set_result(ResultType::ERR);
             result.set_error_msg(e.to_string());
         }
     };
+    let encoded = result.write_to_bytes().map_err(
+        |e| Error::new(ErrorKind::Other, e),
+    )?;
+    let msg = Message::from_slice(&encoded)?;
+    debug!("Responding to client with msg len: {}", msg.len());
+    s.send_msg(msg, 0)?;
     Ok(())
 }
 
@@ -269,20 +373,21 @@ fn handle_get_running_version(s: &mut Socket, c: CephType) -> IOResult<()> {
     match get_running_version(&c) {
         Ok(vers) => {
             result.set_result(ResultType::OK);
-            let v = semver_to_protobuf(vers);
+            let v = semver_to_protobuf(&vers);
             result.set_version(v);
-            let encoded = result.write_to_bytes().map_err(
-                |e| Error::new(ErrorKind::Other, e),
-            )?;
-            let msg = Message::from_slice(&encoded)?;
-            debug!("Responding to client with msg len: {}", msg.len());
-            s.send_msg(msg, 0)?;
+
         }
         Err(e) => {
             result.set_result(ResultType::ERR);
             result.set_error_msg(e.to_string());
         }
     };
+    let encoded = result.write_to_bytes().map_err(
+        |e| Error::new(ErrorKind::Other, e),
+    )?;
+    let msg = Message::from_slice(&encoded)?;
+    debug!("Responding to client with msg len: {}", msg.len());
+    s.send_msg(msg, 0)?;
     Ok(())
 }
 
@@ -308,18 +413,18 @@ fn handle_upgrade(
     ) {
         Ok(_) => {
             result.set_result(ResultType::OK);
-            let encoded = result.write_to_bytes().map_err(
-                |e| Error::new(ErrorKind::Other, e),
-            )?;
-            let msg = Message::from_slice(&encoded)?;
-            debug!("Responding to client with msg len: {}", msg.len());
-            s.send_msg(msg, 0)?;
         }
         Err(e) => {
             result.set_result(ResultType::ERR);
             result.set_error_msg(e.to_string());
         }
     };
+    let encoded = result.write_to_bytes().map_err(
+        |e| Error::new(ErrorKind::Other, e),
+    )?;
+    let msg = Message::from_slice(&encoded)?;
+    debug!("Responding to client with msg len: {}", msg.len());
+    s.send_msg(msg, 0)?;
     Ok(())
 }
 
@@ -409,6 +514,42 @@ fn installed_version_request(s: &mut Socket) -> Result<Version, String> {
     }
 }
 
+fn list_hosts_request(s: &mut Socket) -> Result<Vec<CephServer>, String> {
+    let mut o = Operation::new();
+    debug!("Creating list_hosts operation request");
+    o.set_Op_type(Op::ListHosts);
+
+    let encoded = o.write_to_bytes().unwrap();
+    let msg = Message::from_slice(&encoded).map_err(|e| e.to_string())?;
+    debug!("Sending message");
+    s.send_msg(msg, 0).map_err(|e| e.to_string())?;
+
+    debug!("Waiting for response");
+    let list_hosts_response = s.recv_bytes(0).map_err(|e| e.to_string())?;
+    debug!("Decoding msg len: {}", list_hosts_response.len());
+    let op_result = parse_from_bytes::<HostResult>(&list_hosts_response)
+        .map_err(|e| e.to_string())?;
+    match op_result.get_result() {
+        ResultType::OK => {
+            let hosts = op_result.get_hosts();
+            debug!("Got hosts: {:?}", hosts);
+            Ok(hosts.to_vec())
+        }
+        ResultType::ERR => {
+            if op_result.has_error_msg() {
+                let msg = op_result.get_error_msg();
+                error!("List hosts request failed: {}", msg);
+                Err(op_result.get_error_msg().into())
+            } else {
+                error!("List hosts request but error_msg not set");
+                Err(
+                    "List hosts request failed but error_msg not set".to_string(),
+                )
+            }
+        }
+    }
+}
+
 fn upgrade_request(
     s: &mut Socket,
     version: Version,
@@ -465,14 +606,73 @@ fn upgrade_request(
     }
 }
 
-// Upload this binary to all hosts on a host:port combo and launch it
-fn upload_and_execute(hosts: Vec<(String, u16)>, listen_port: u16) -> IOResult<()> {
-    // Create an ssh mastercontrol port.
-    // Run an ssh command over the port to get to the first host
-    // discover the topology of the cluster
-    // copy this binary to all the other hosts in the cluster
-    // startup the binary and have it listen on a port
-    // shutdown the ssh mastercontrol port and use zmq to connect to all the machines
+fn scp_binary(
+    binary_name: &OsStr,
+    payload: &PathBuf,
+    ssh_user: &Option<&str>,
+    host: (&str, u16),
+) -> IOResult<()> {
+    info!("Binary: {:?}", binary_name);
+    info!("Uploading {} to {}:{}", payload.display(), host.0, host.1);
+    let mut c = Command::new("scp");
+    c.arg("-P");
+    c.arg(&host.1.to_string());
+    c.arg(&format!("{}", payload.display()));
+    if let &Some(ssh_user) = ssh_user {
+        c.arg(&format!("{}@{}:", ssh_user, host.0));
+    } else {
+        c.arg(&format!("{}:", host.0));
+    }
+    c.output()?;
+    info!("scp: {:?}", c);
+    if !c.status()?.success() {
+        return Err(Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn start_binary(
+    binary_name: &OsStr,
+    ssh_user: &Option<&str>,
+    host: (&str, u16),
+    listen_port: u16,
+    version: &DebianVersion,
+) -> IOResult<()> {
+    let mut run = Command::new("ssh");
+    run.arg("-p");
+    run.arg(&host.1.to_string());
+    if let &Some(ssh_user) = ssh_user {
+        run.arg(&format!("{}@{}", ssh_user, host.0));
+    } else {
+        run.arg(host.0);
+    }
+    run.args(
+        &[
+            "nohup",
+            "sudo",
+            &format!("./{}", binary_name.to_string_lossy()),
+            "--port",
+            &listen_port.to_string(),
+            "--version",
+            &format!("{}", version),
+            "&",
+        ],
+    ).spawn()?;
+    info!("ssh: {:?}", run);
+    thread::sleep(time::Duration::from_secs(1));
+    Ok(())
+}
+
+// host: (address, ssh port), skynet listen port
+fn upload_and_execute(
+    ssh_user: Option<&str>,
+    host: (String, u16),
+    listen_port: u16,
+    version: &DebianVersion,
+) -> IOResult<()> {
+    // 1. Upload this binary to the first host
+    // 2. Ask the first host to list the other hosts.
+    // 3. Upload to the other hosts, start and tell first host to kick off the upgrade
     let payload = std::env::current_exe()?;
     let binary_name = payload
         .file_name()
@@ -480,44 +680,29 @@ fn upload_and_execute(hosts: Vec<(String, u16)>, listen_port: u16) -> IOResult<(
             "Unable to determine skynet's filename to send to remote hosts",
         )
         .map_err(|e| Error::new(ErrorKind::Other, e))?;
-    for h in hosts {
-        let c = Command::new("scp")
-            .args(
-                &[
-                    "-P",
-                    &h.1.to_string(),
-                    &format!("{}:", payload.display()),
-                    &h.0,
-                ],
-            )
-            .output()?;
-        if !c.status.success() {
-            return Err(Error::last_os_error());
-        }
-        let run = Command::new("ssh")
-            .args(
-                &[
-                    "nohup",
-                    &binary_name.to_string_lossy(),
-                    "--port",
-                    &listen_port.to_string(),
-                ],
-            )
-            .output()?;
-        if !run.status.success() {
-            return Err(Error::last_os_error());
-        }
-    }
-    Ok(())
-}
-
-fn create_multiplex(host: &str, user: Option<&str>) -> IOResult<()> {
-    let mut c = Command::new("ssh");
-    c.args(&["-A", "-M", "-S", "mastercontrol"]);
-    if let Some(user) = user {
-        c.arg(&format!("{}@{}", user, host));
-    } else {
-        c.arg(host);
+    info!("Uploading to {}", host.0);
+    scp_binary(&binary_name, &payload, &ssh_user, (&host.0, host.1))?;
+    info!("Starting skynet on {}", host.0);
+    start_binary(&binary_name, &ssh_user, (&host.0, 22), listen_port, version)?;
+    info!("connecting to {}:{}", host.0, listen_port);
+    let mut conn = connect(&host.0, listen_port).map_err(|e| {
+        Error::new(ErrorKind::Other, e)
+    })?;
+    info!("Requesting ceph cluster host list");
+    let cluster_hosts = list_hosts_request(&mut conn).map_err(|e| {
+        Error::new(ErrorKind::Other, e)
+    })?;
+    info!("Cluster hosts: {:?}", cluster_hosts);
+    for h in cluster_hosts {
+        info!("Uploading to {}", h.get_addr());
+        scp_binary(&binary_name, &payload, &ssh_user, (h.get_addr(), 22))?;
+        start_binary(
+            &binary_name,
+            &ssh_user,
+            (h.get_addr(), 22),
+            listen_port,
+            version,
+        )?;
     }
     Ok(())
 }
@@ -528,24 +713,17 @@ fn main() {
         .author(crate_authors!())
         .about("Upgrade ceph automatically")
         .arg(
-            Arg::with_name("leader")
-                .help("Is this a leader or follower node.")
-                .long("leader")
-                .short("l")
-                .required(false),
-        )
-        .arg(
-            Arg::with_name("log")
-                .default_value("/var/log/skynet.log")
-                .help("Default log file location")
-                .long("logfile")
+            Arg::with_name("host")
+                .help("Host to gather cluster info and coordinate the upgrade")
+                .long("host")
                 .takes_value(true)
                 .required(false),
         )
         .arg(
             Arg::with_name("port")
                 .default_value("5556")
-                .help("Port to listen on")
+                .help("Port for upgrade servers listen on")
+                .short("p")
                 .long("port")
                 .takes_value(true)
                 .required(false),
@@ -585,6 +763,20 @@ fn main() {
                 .takes_value(true)
                 .required(false),
         )
+        .arg(
+            Arg::with_name("ssh_user")
+                .help("User to ssh with")
+                .long("sshuser")
+                .takes_value(true)
+                .required(false),
+        )
+        .arg(
+            Arg::with_name("ssh_identity")
+                .help("SSH identity file to use")
+                .long("sshidentity")
+                .takes_value(true)
+                .required(false),
+        )
         .arg(Arg::with_name("v").short("v").multiple(true).help(
             "Sets the level of verbosity",
         ))
@@ -594,63 +786,39 @@ fn main() {
         1 => log::LogLevelFilter::Debug,
         _ => log::LogLevelFilter::Trace,
     };
-    let _ = CombinedLogger::init(vec![
-        TermLogger::new(level, Config::default()).unwrap(),
-        WriteLogger::new(
-            level,
-            Config::default(),
-            File::create(matches.value_of("log").unwrap()).unwrap()
-        ),
-    ]);
-    let http_proxy: Option<&str> = matches.value_of("http_proxy");
-    let https_proxy: Option<&str> = matches.value_of("https_proxy");
-    let gpg_key: Option<&str> = matches.value_of("repo_key");
-    let apt_source: Option<&str> = matches.value_of("repo_source");
-    let port = u16::from_str(matches.value_of("port").unwrap()).unwrap();
-    let v = DebianVersion::parse(matches.value_of("version").unwrap()).unwrap();
-    if matches.is_present("leader") {
-        //Initiate the discovery leader
-        let cluster_hosts = match ceph_upgrade::discover_topology() {
-            Ok(hosts) => hosts,
-            Err(e) => {
-                error!("Discovering the cluster topology failed: {:?}.  Exiting", e);
-                return;
-            }
-        };
-        debug!("Cluster hosts: {:?}", cluster_hosts);
-        if let Err(e) = upload_and_execute(vec![], port) {
+    println!("{:?}", level);
+    let _ = SimpleLogger::init(level, Config::default()).unwrap();
+    info!("Skynet starting up");
+    let host = matches.value_of("host");
+    let http_proxy = matches.value_of("http_proxy");
+    let https_proxy = matches.value_of("https_proxy");
+    let gpg_key = matches.value_of("repo_key");
+    let apt_source = matches.value_of("repo_source");
+    let port = u16::from_str(matches.value_of("port").expect("port option missing")).unwrap();
+    let ssh_user = matches.value_of("ssh_user");
+    let ssh_identity = matches.value_of("ssh_identity");
+    let v = DebianVersion::parse(matches.value_of("version").expect("version option missing"))
+        .unwrap();
+    debug!("version requested: {:?}", v);
+
+    // Uploading to first host and setting up
+    if let Some(host) = host {
+        if let Err(e) = upload_and_execute(ssh_user, (host.to_string(), 22), port, &v) {
             error!("Uploading and starting binaries failed: {:?}. exiting", e);
             return;
         }
-        match ceph_upgrade::roll_cluster(
-            &v,
-            cluster_hosts,
-            port,
-            http_proxy,
-            https_proxy,
-            gpg_key,
-            apt_source,
-        ) {
-            Ok(_) => {
-                info!("Cluster rolling upgrade completed");
-            }
-            Err(e) => {
-                error!("Cluster rolling upgrade failed: {:?}", e);
-                return;
-            }
-        };
-    } else {
-        //follower
-        //start up a listener
-        match listen(port) {
-            Ok(_) => {
-                info!("Listen finished");
-                return;
-            }
-            Err(e) => {
-                error!("Listen failed: {:?}", e);
-                return;
-            }
-        };
     }
+
+    info!("I am a follower");
+    //start up a listener
+    match listen(port, &v, http_proxy, https_proxy, gpg_key, apt_source) {
+        Ok(_) => {
+            info!("Listen finished");
+            return;
+        }
+        Err(e) => {
+            error!("Listen failed: {:?}", e);
+            return;
+        }
+    };
 }

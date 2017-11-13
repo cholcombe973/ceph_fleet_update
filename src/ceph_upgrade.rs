@@ -19,7 +19,7 @@ use std::time::SystemTime;
 use self::api::service::Version as ApiVersion;
 use self::api::service::CephComponent;
 use self::ceph_rust::ceph::{connect_to_ceph, ceph_version, disconnect_from_ceph};
-use self::ceph_rust::cmd::{mon_dump, osd_tree};
+use self::ceph_rust::cmd::{mon_dump, osd_unset, osd_set, osd_tree};
 use self::init_daemon::{detect_daemon, Daemon};
 use self::nix::unistd::chown;
 use self::semver::Version as SemVer;
@@ -130,10 +130,11 @@ pub fn discover_topology() -> Result<Vec<(CephServer, CephType)>, String> {
     )?;
 
     let mon_info = mon_dump(handle).map_err(|e| e.to_string())?;
+    debug!("mon_info: {:#?}", mon_info);
     for mon in mon_info.mons {
         cluster.push((
             CephServer {
-                addr: mon.addr.split("").next().unwrap().to_string(),
+                addr: mon.addr.split(":").next().unwrap().to_string(),
                 id: mon.name,
                 rank: Some(mon.rank),
             },
@@ -141,10 +142,14 @@ pub fn discover_topology() -> Result<Vec<(CephServer, CephType)>, String> {
         ));
     }
     let osd_info = osd_tree(handle).map_err(|e| e.to_string())?;
-    for osd in osd_info.nodes {
+    debug!("osd_info: {:#?}", osd_info);
+    for osd in osd_info.nodes.iter().filter(
+        |o| o.crush_type == "host".to_string(),
+    )
+    {
         cluster.push((
             CephServer {
-                addr: osd.name,
+                addr: osd.name.clone(),
                 id: osd.id.to_string(),
                 rank: None,
             },
@@ -292,25 +297,44 @@ impl CephNode {
             apt::get_installed_package_version("ceph")?,
             version
         );
+        let handle = connect_to_ceph("admin", "/etc/ceph/ceph.conf").map_err(
+            |e| {
+                e.to_string()
+            },
+        )?;
         let backed_files = backup_conf_files().map_err(|e| e.to_string())?;
 
-        //TODO Install new sources if needed
         if let Some(gpg_key) = gpg_key {
             apt::get_gpg_key(gpg_key).map_err(|e| e.to_string())?;
         }
         if let Some(apt_source) = apt_source {
             apt::add_source(apt_source).map_err(|e| e.to_string())?;
         }
-        self.upgrade(http_proxy, https_proxy).map_err(
+        // install apt proxy if needed
+        if let Some(http_proxy) = http_proxy {
+            debug!("apt http_proxy set: {}", http_proxy);
+            if let Some(https_proxy) = https_proxy {
+                debug!("apt https_proxy set: {}", https_proxy);
+                apt::ensure_proxy(http_proxy, https_proxy).map_err(
+                    |e| e.to_string(),
+                )?;
+            }
+        }
+        self.upgrade(version).map_err(|e| e.to_string())?;
+        restore_conf_files(&backed_files).map_err(|e| e.to_string())?;
+        debug!("Setting noout, nodown to prevent cluster rebuilding");
+        osd_set(handle, "noout", false, false).map_err(
             |e| e.to_string(),
         )?;
-        restore_conf_files(&backed_files).map_err(|e| e.to_string())?;
+        osd_set(handle, "nodown", false, false).map_err(
+            |e| e.to_string(),
+        )?;
         match c {
             CephComponent::Mon => {
                 self.restart_mon().map_err(|e| e.to_string())?;
             }
             CephComponent::Osd => {
-                self.upgrade_osd(version).map_err(|e| e.to_string())?;
+                self.restart_osd().map_err(|e| e.to_string())?;
             }
             CephComponent::Rgw => {
                 self.restart_rgw().map_err(|e| e.to_string())?;
@@ -319,22 +343,34 @@ impl CephNode {
                 self.restart_mds().map_err(|e| e.to_string())?;
             }
         };
+        debug!("Unsetting noout, nodown");
+        osd_unset(handle, "noout", false).map_err(|e| e.to_string())?;
+        osd_unset(handle, "nodown", false).map_err(
+            |e| e.to_string(),
+        )?;
 
         return Ok(());
     }
 
-    fn upgrade(&self, http_proxy: Option<&str>, https_proxy: Option<&str>) -> IOResult<()> {
+    fn upgrade(&self, version: &ApiVersion) -> IOResult<()> {
         //basic upgrade things that all nodes need to do
-
-        // install apt proxy if needed
-        if let Some(http_proxy) = http_proxy {
-            debug!("apt http_proxy set: {}", http_proxy);
-            if let Some(https_proxy) = https_proxy {
-                debug!("apt https_proxy set: {}", https_proxy);
-                apt::ensure_proxy(http_proxy, https_proxy)?;
-            }
-        }
         apt::apt_update()?;
+
+        // debian version
+        let candidate = apt::get_candidate_package_version("ceph").map_err(|e| {
+            Error::new(ErrorKind::Other, e)
+        })?;
+        let candidate_version = super::version_to_protobuf(&candidate);
+
+        if version != &candidate_version {
+            error!(
+                "Candidate version {:?} doesn't match requested version: {:?}",
+                candidate_version,
+                version
+            );
+            // TODO: Should we abort the upgrade if the requested version isn't matching?
+        }
+
         apt::apt_remove(vec![
             "ceph",
             "ceph-base",
@@ -411,7 +447,8 @@ impl CephNode {
         self.restart_service(CephType::Mds)?;
         Ok(())
     }
-    fn upgrade_osd(&self, version: &ApiVersion) -> IOResult<()> {
+
+    fn restart_osd(&self) -> IOResult<()> {
         // ask ceph for all the osds that this host owns.
         let hostname = {
             let mut f = File::open("/etc/hostname")?;
@@ -599,15 +636,11 @@ impl CephNode {
         Ok(())
     }
 
-    // Examine a node and return a list of running ceph processes on it
-    fn scan_node_for_ceph_processes(&self) -> Result<Vec<CephType>, String> {
-        //TODO: Scan the crushmap to get this info?
+    fn scan_node_for_ceph_processes(&self) -> IOResult<Vec<CephType>> {
         let mut ceph_processes: Vec<CephType> = Vec::new();
-        for entry in try!(read_dir(Path::new("/var/run/ceph")).map_err(
-            |e| e.to_string(),
-        ))
+        for entry in read_dir(Path::new("/var/run/ceph"))?
         {
-            let entry = try!(entry.map_err(|e| e.to_string()));
+            let entry = entry?;
             let sock_addr_osstr = entry.file_name();
             let file_name = match sock_addr_osstr.to_str() {
                 Some(name) => name,

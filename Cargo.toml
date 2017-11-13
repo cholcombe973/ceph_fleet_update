@@ -1,5 +1,5 @@
 [package]
-name = "ceph_fleet_update"
+name = "skynet"
 version = "0.1.0"
 authors = ["Chris Holcombe <xfactor973@gmail.com>"]
 license = "MIT"
@@ -41,8 +41,3 @@ debug = false
 rpath = false
 lto = false
 debug-assertions = false
-
-
-[[bin]]
-name = "main"
-path = "src/main.rs"

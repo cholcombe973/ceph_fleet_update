@@ -27,6 +27,20 @@ message VersionPart {
 }
 // Debian specific Version messages
 
+// Host Result messages
+message HostResult {
+  required ResultType result = 1;
+  repeated CephServer hosts = 2;
+  optional string error_msg = 3;
+}
+
+message CephServer {
+  required string addr = 1;
+  required string id = 2;
+  optional int64 rank = 3;
+  required CephComponent component = 4;
+}
+
 message OpResult {
   required ResultType result = 1;
   optional string error_msg = 2;
@@ -51,6 +65,9 @@ enum Op {
   // Start upgrading yourself
   Upgrade = 3;
   Stop = 4;
+  ListHosts = 5;
+  // Transition to leader and start rolling upgrade
+  BecomeLeader = 6;
 }
 
 // Service operations that can be performed
