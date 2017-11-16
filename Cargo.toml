@@ -12,6 +12,7 @@ clap = "*"
 chrono = { version = "~0.4", features = ["rustc-serialize"] }
 debian = {git = "https://github.com/mwanner/rust-debian" }
 error-chain = "0.10.0"
+ifaces = "*"
 init-daemon = "*"
 log = {version = "0.3.6", features = ["release_max_level_info"] }
 nix = "~0.9"

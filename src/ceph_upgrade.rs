@@ -9,6 +9,7 @@ extern crate regex;
 extern crate semver;
 extern crate uuid;
 
+use std::fmt;
 use std::fs::{copy, File, metadata, read_dir, remove_file};
 use std::io::{Error, ErrorKind, Read, Write};
 use std::io::Result as IOResult;
@@ -34,6 +35,17 @@ pub enum CephType {
     Osd,
     Mds,
     Rgw,
+}
+
+impl fmt::Display for CephType {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            &CephType::Mds => write!(f, "Mds"),
+            &CephType::Mon => write!(f, "Mon"),
+            &CephType::Osd => write!(f, "Osd"),
+            &CephType::Rgw => write!(f, "Rgw"),
+        }
+    }
 }
 
 impl From<CephComponent> for CephType {
@@ -106,17 +118,22 @@ fn backup_conf_files() -> IOResult<Vec<PathBuf>> {
         // Should only be conf files in here
         if !path.is_dir() {
             // cp /etc/ceph/ceph.conf /tmp/ceph.conf
-            copy(path.clone(), format!("/tmp/{}", path.display()))?;
-            backed_up.push(path.clone());
+            let f = entry.file_name();
+            debug!("cp {} to /tmp/{:?}", path.display(), f);
+            copy(path.clone(), format!("/tmp/{}", f.to_string_lossy()))?;
+            backed_up.push(PathBuf::from(format!("/tmp/{}", f.to_string_lossy())));
         }
     }
     Ok(backed_up)
 }
 
 fn restore_conf_files(files: &Vec<PathBuf>) -> IOResult<()> {
-    debug!("Restoring config files to /etc/ceph");
+    debug!("Restoring config files {:?} to /etc/ceph", files);
     for f in files {
-        copy(f.clone(), format!("/etc/ceph/{}", f.display()))?;
+        copy(
+            f.clone(),
+            format!("/etc/ceph/{}", f.file_name().unwrap().to_string_lossy()),
+        )?;
     }
     Ok(())
 }
@@ -171,27 +188,55 @@ fn connect_and_upgrade(
     apt_source: Option<&str>,
 ) -> Result<(), String> {
     for s in servers {
-        debug!("Connecting to {} to request upgrade", s.addr);
-        let mut req_socket = super::connect(&s.addr, port).map_err(|e| e.to_string())?;
-        debug!("Requesting {} to upgrade", s.addr);
-        match super::upgrade_request(
-            &mut req_socket,
-            super::version_to_protobuf(new_version),
-            c,
-            http_proxy,
-            https_proxy,
-            gpg_key,
-            apt_source,
-        ) {
-            Ok(_) => {
-                info!("Upgrade succeeded.  Proceeding to next");
-                continue;
-            }
-            Err(e) => {
-                error!("Upgrade failed: {}", e);
-                continue;
-            }
+        // First check if I own this ip address. If so then skip the RPC request
+        let owned_ip = match super::owned_ip(&s.addr) {
+            Ok(result) => result,
+            // Ignore errors for now.  Osds use hostnames and mons use ip's
+            Err(_) => false,
         };
+        if owned_ip {
+            let node = CephNode::new();
+            match node.upgrade_node(
+                //ApiVersion::from(new_version),
+                &super::version_to_protobuf(new_version),
+                CephComponent::from(c.clone()),
+                http_proxy,
+                https_proxy,
+                gpg_key,
+                apt_source,
+            ) {
+                Ok(_) => {
+                    info!("Upgrade succeeded.  Proceeding to next");
+                    continue;
+                }
+                Err(e) => {
+                    error!("Upgrade failed: {}", e);
+                    continue;
+                }
+            }
+        } else {
+            debug!("Connecting to {}:{} to request upgrade", c, s.addr);
+            let mut req_socket = super::connect(&s.addr, port).map_err(|e| e.to_string())?;
+            debug!("Requesting {} to upgrade", s.addr);
+            match super::upgrade_request(
+                &mut req_socket,
+                super::version_to_protobuf(new_version),
+                c,
+                http_proxy,
+                https_proxy,
+                gpg_key,
+                apt_source,
+            ) {
+                Ok(_) => {
+                    info!("Upgrade succeeded.  Proceeding to next");
+                    continue;
+                }
+                Err(e) => {
+                    error!("Upgrade failed: {}", e);
+                    continue;
+                }
+            };
+        }
     }
     Ok(())
 }
@@ -305,9 +350,11 @@ impl CephNode {
         let backed_files = backup_conf_files().map_err(|e| e.to_string())?;
 
         if let Some(gpg_key) = gpg_key {
+            debug!("Adding gpg key: {}", gpg_key);
             apt::get_gpg_key(gpg_key).map_err(|e| e.to_string())?;
         }
         if let Some(apt_source) = apt_source {
+            debug!("Adding apt source: {}", apt_source);
             apt::add_source(apt_source).map_err(|e| e.to_string())?;
         }
         // install apt proxy if needed
@@ -331,15 +378,19 @@ impl CephNode {
         )?;
         match c {
             CephComponent::Mon => {
+                debug!("Restarting mon");
                 self.restart_mon().map_err(|e| e.to_string())?;
             }
             CephComponent::Osd => {
+                debug!("Restarting osd");
                 self.restart_osd().map_err(|e| e.to_string())?;
             }
             CephComponent::Rgw => {
+                debug!("Restarting rgw");
                 self.restart_rgw().map_err(|e| e.to_string())?;
             }
             CephComponent::Mds => {
+                debug!("Restarting mds");
                 self.restart_mds().map_err(|e| e.to_string())?;
             }
         };
@@ -353,6 +404,7 @@ impl CephNode {
     }
 
     fn upgrade(&self, version: &ApiVersion) -> IOResult<()> {
+        info!("Beginning upgrade procedure");
         //basic upgrade things that all nodes need to do
         apt::apt_update()?;
 
@@ -638,8 +690,7 @@ impl CephNode {
 
     fn scan_node_for_ceph_processes(&self) -> IOResult<Vec<CephType>> {
         let mut ceph_processes: Vec<CephType> = Vec::new();
-        for entry in read_dir(Path::new("/var/run/ceph"))?
-        {
+        for entry in read_dir(Path::new("/var/run/ceph"))? {
             let entry = entry?;
             let sock_addr_osstr = entry.file_name();
             let file_name = match sock_addr_osstr.to_str() {

@@ -31,6 +31,7 @@ pub fn apt_update() -> IOResult<()> {
     let mut cmd = Command::new("apt-get");
     cmd.arg("update");
     cmd.arg("-q");
+    debug!("apt-get cmd {:?}", cmd);
     let output = cmd.output()?;
     if !output.status.success() {
         return Err(Error::new(
@@ -70,6 +71,7 @@ pub fn apt_remove(packages: Vec<&str>) -> IOResult<()> {
         cmd.arg(package);
     }
     cmd.arg("--purge");
+    debug!("apt remove cmd: {:?}", cmd);
     let output = cmd.output()?;
     if !output.status.success() {
         return Err(Error::new(

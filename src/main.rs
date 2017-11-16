@@ -2,6 +2,7 @@ extern crate api;
 #[macro_use]
 extern crate clap;
 extern crate debian;
+extern crate ifaces;
 #[macro_use]
 extern crate log;
 extern crate os_type;
@@ -18,6 +19,7 @@ mod ceph_upgrade;
 use std::ffi::OsStr;
 use std::io::{Error, ErrorKind};
 use std::io::Result as IOResult;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::Command;
 use std::str::FromStr;
@@ -30,6 +32,7 @@ use api::service::{CephComponent, CephServer, HostResult, Op, Operation, ResultT
 use ceph_upgrade::{get_running_version, CephType, CephNode};
 use clap::{Arg, App};
 use debian::version::Version as DebianVersion;
+use ifaces::Interface;
 use protobuf::Message as ProtobufMsg;
 use protobuf::core::parse_from_bytes;
 use protobuf::repeated::RepeatedField;
@@ -52,13 +55,14 @@ fn listen(
     gpg_key: Option<&str>,
     apt_source: Option<&str>,
 ) -> ZmqResult<()> {
-    debug!("Starting zmq listener with version({:?})", zmq::version());
+    debug!(
+        "Starting zmq listener thread with version({:?})",
+        zmq::version()
+    );
     let context = zmq::Context::new();
-    let mut responder = context.socket(zmq::REP)?;
-
+    let mut responder: Socket = context.socket(zmq::REP)?;
     debug!("Listening on tcp://*:{}", port);
     assert!(responder.bind(&format!("tcp://*:{}", port)).is_ok());
-
     loop {
         let msg = responder.recv_bytes(0)?;
         debug!("Got msg len: {}", msg.len());
@@ -289,7 +293,8 @@ fn handle_become_leader(
             ));
         }
     };
-    info!("Cluster hosts: {:?}", cluster_hosts);
+    debug!("apt_source: {:?}", apt_source);
+    debug!("Cluster hosts: {:?}", cluster_hosts);
     match ceph_upgrade::roll_cluster(
         &version,
         cluster_hosts,
@@ -440,6 +445,39 @@ fn connect(host: &str, port: u16) -> ZmqResult<Socket> {
             .is_ok()
     );
     Ok(requester)
+}
+
+fn become_leader_request(s: &mut Socket) -> Result<(), String> {
+    let mut o = Operation::new();
+    debug!("Creating become_leader operation request");
+    o.set_Op_type(Op::BecomeLeader);
+
+    let encoded = o.write_to_bytes().unwrap();
+    let msg = Message::from_slice(&encoded).map_err(|e| e.to_string())?;
+    debug!("Sending message");
+    s.send_msg(msg, 0).map_err(|e| e.to_string())?;
+
+    debug!("Waiting for response");
+    let leader_resp = s.recv_bytes(0).map_err(|e| e.to_string())?;
+    let op_result = parse_from_bytes::<OpResult>(&leader_resp).map_err(
+        |e| e.to_string(),
+    )?;
+    match op_result.get_result() {
+        ResultType::OK => {
+            debug!("Become leader succeeded ");
+            Ok(())
+        }
+        ResultType::ERR => {
+            if op_result.has_error_msg() {
+                let msg = op_result.get_error_msg();
+                error!("Become leader request failed: {}", msg);
+                Err(op_result.get_error_msg().into())
+            } else {
+                error!("Become leader but error_msg not set");
+                Err("Become leader failed but error_msg not set".to_string())
+            }
+        }
+    }
 }
 
 fn running_version_request(s: &mut Socket) -> Result<Version, String> {
@@ -606,6 +644,27 @@ fn upgrade_request(
     }
 }
 
+fn owned_ip(s: &str) -> Result<bool, String> {
+    debug!("owned_ip: {}", s);
+    let my_netifaces = Interface::get_all().map_err(|e| e.to_string())?;
+    let s_sockaddr = if s.contains(":") {
+        SocketAddr::from_str(s).map_err(|e| e.to_string())?
+    } else {
+        SocketAddr::from_str(&format!("{}:0", s)).map_err(
+            |e| e.to_string(),
+        )?
+    };
+    for iface in my_netifaces {
+        if let Some(addr) = iface.addr {
+            if addr == s_sockaddr {
+                //
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
 fn scp_binary(
     binary_name: &OsStr,
     payload: &PathBuf,
@@ -624,9 +683,14 @@ fn scp_binary(
         c.arg(&format!("{}:", host.0));
     }
     c.output()?;
-    info!("scp: {:?}", c);
+    debug!("scp: {:?}", c);
     if !c.status()?.success() {
-        return Err(Error::last_os_error());
+        let e = Error::last_os_error();
+        match e.kind() {
+            //The binary is already uploaded and running
+            ErrorKind::WouldBlock => return Ok(()),
+            _ => return Err(e),
+        }
     }
     Ok(())
 }
@@ -637,6 +701,10 @@ fn start_binary(
     host: (&str, u16),
     listen_port: u16,
     version: &DebianVersion,
+    http_proxy: Option<&str>,
+    https_proxy: Option<&str>,
+    repo_key: Option<&str>,
+    repo_source: Option<&str>,
 ) -> IOResult<()> {
     let mut run = Command::new("ssh");
     run.arg("-p");
@@ -655,10 +723,29 @@ fn start_binary(
             &listen_port.to_string(),
             "--version",
             &format!("{}", version),
-            "&",
+            "-vv",
         ],
-    ).spawn()?;
-    info!("ssh: {:?}", run);
+    );
+    if let Some(http_proxy) = http_proxy {
+        run.arg("--httpproxy");
+        run.arg(http_proxy);
+    }
+    if let Some(https_proxy) = https_proxy {
+        run.arg("--httpsproxy");
+        run.arg(https_proxy);
+    }
+    if let Some(repo_key) = repo_key {
+        run.arg("--repokey");
+        run.arg(repo_key);
+    }
+    if let Some(repo_source) = repo_source {
+        run.arg("--reposource");
+        run.arg(repo_source);
+    }
+    run.args(&["2>&1 > skynet.log", "&"]);
+
+    run.spawn()?;
+    debug!("ssh: {:?}", run);
     thread::sleep(time::Duration::from_secs(1));
     Ok(())
 }
@@ -669,10 +756,15 @@ fn upload_and_execute(
     host: (String, u16),
     listen_port: u16,
     version: &DebianVersion,
-) -> IOResult<()> {
+    http_proxy: Option<&str>,
+    https_proxy: Option<&str>,
+    repo_key: Option<&str>,
+    repo_source: Option<&str>,
+) -> IOResult<Socket> {
     // 1. Upload this binary to the first host
     // 2. Ask the first host to list the other hosts.
     // 3. Upload to the other hosts, start and tell first host to kick off the upgrade
+    let mut finished_hosts: Vec<String> = Vec::new();
     let payload = std::env::current_exe()?;
     let binary_name = payload
         .file_name()
@@ -683,8 +775,20 @@ fn upload_and_execute(
     info!("Uploading to {}", host.0);
     scp_binary(&binary_name, &payload, &ssh_user, (&host.0, host.1))?;
     info!("Starting skynet on {}", host.0);
-    start_binary(&binary_name, &ssh_user, (&host.0, 22), listen_port, version)?;
-    info!("connecting to {}:{}", host.0, listen_port);
+    start_binary(
+        &binary_name,
+        &ssh_user,
+        (&host.0, 22),
+        listen_port,
+        version,
+        http_proxy,
+        https_proxy,
+        repo_key,
+        repo_source,
+    )?;
+    finished_hosts.push(host.0.clone());
+    thread::sleep(Duration::from_secs(1));
+    debug!("connecting to {}:{}", host.0, listen_port);
     let mut conn = connect(&host.0, listen_port).map_err(|e| {
         Error::new(ErrorKind::Other, e)
     })?;
@@ -692,19 +796,30 @@ fn upload_and_execute(
     let cluster_hosts = list_hosts_request(&mut conn).map_err(|e| {
         Error::new(ErrorKind::Other, e)
     })?;
-    info!("Cluster hosts: {:?}", cluster_hosts);
+    debug!("Cluster hosts: {:?}", cluster_hosts);
     for h in cluster_hosts {
+        info!("finished_hosts: {:?}", finished_hosts);
+        if finished_hosts.contains(&h.get_addr().to_string()) {
+            info!("Host already finished.  Skipping");
+            continue;
+        }
         info!("Uploading to {}", h.get_addr());
-        scp_binary(&binary_name, &payload, &ssh_user, (h.get_addr(), 22))?;
+        let res = scp_binary(&binary_name, &payload, &ssh_user, (h.get_addr(), 22));
+        info!("scp: {:?}", res);
         start_binary(
             &binary_name,
             &ssh_user,
             (h.get_addr(), 22),
             listen_port,
             version,
+            http_proxy,
+            https_proxy,
+            repo_key,
+            repo_source,
         )?;
+        finished_hosts.push(h.get_addr().to_string());
     }
-    Ok(())
+    Ok(conn)
 }
 
 fn main() {
@@ -803,22 +918,39 @@ fn main() {
 
     // Uploading to first host and setting up
     if let Some(host) = host {
-        if let Err(e) = upload_and_execute(ssh_user, (host.to_string(), 22), port, &v) {
-            error!("Uploading and starting binaries failed: {:?}. exiting", e);
-            return;
+        if let Ok(mut s) = upload_and_execute(
+            ssh_user,
+            (host.to_string(), 22),
+            port,
+            &v,
+            http_proxy,
+            https_proxy,
+            gpg_key,
+            apt_source,
+        )
+        {
+            match become_leader_request(&mut s) {
+                Ok(_) => {
+                    info!("become leader request successful");
+                }
+                Err(e) => {
+                    error!("become leader failed: {}", e);
+                    return;
+                }
+            };
         }
+    } else {
+        info!("I am a follower");
+        //start up a listener
+        match listen(port, &v, http_proxy, https_proxy, gpg_key, apt_source) {
+            Ok(_) => {
+                info!("Listen finished");
+                return;
+            }
+            Err(e) => {
+                error!("Listen failed: {:?}", e);
+                return;
+            }
+        };
     }
-
-    info!("I am a follower");
-    //start up a listener
-    match listen(port, &v, http_proxy, https_proxy, gpg_key, apt_source) {
-        Ok(_) => {
-            info!("Listen finished");
-            return;
-        }
-        Err(e) => {
-            error!("Listen failed: {:?}", e);
-            return;
-        }
-    };
 }
