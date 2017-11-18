@@ -15,7 +15,7 @@ error-chain = "0.10.0"
 ifaces = "*"
 init-daemon = "*"
 log = {version = "0.3.6", features = ["release_max_level_info"] }
-nix = "~0.9"
+nix = "*"
 os_type = "1.0.0"
 protobuf = "*"
 rand = "~0.3"
@@ -24,7 +24,9 @@ reqwest = "~0.8"
 semver = "*"
 simplelog = "*"
 slack-hook = "*"
+users = "*"
 uuid = { version = "^0.4", features = ["v4"] }
+walkdir = "*"
 zmq = "*"
 
 # The development profile, used for `cargo build`

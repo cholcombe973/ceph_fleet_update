@@ -7,10 +7,12 @@ extern crate rand;
 extern crate reqwest;
 extern crate regex;
 extern crate semver;
+extern crate users;
 extern crate uuid;
+extern crate walkdir;
 
 use std::fmt;
-use std::fs::{copy, File, metadata, read_dir, remove_file};
+use std::fs::{copy, File, read_dir, remove_file};
 use std::io::{Error, ErrorKind, Read, Write};
 use std::io::Result as IOResult;
 use std::path::{Path, PathBuf};
@@ -22,8 +24,10 @@ use self::api::service::CephComponent;
 use self::ceph_rust::ceph::{connect_to_ceph, ceph_version, disconnect_from_ceph};
 use self::ceph_rust::cmd::{mon_dump, osd_unset, osd_set, osd_tree};
 use self::init_daemon::{detect_daemon, Daemon};
-use self::nix::unistd::chown;
+use self::nix::unistd::{chown, Gid, Uid};
 use self::semver::Version as SemVer;
+use self::users::get_user_by_name;
+use self::walkdir::WalkDir;
 
 use super::apt;
 use super::debian::version::Version;
@@ -254,12 +258,8 @@ pub fn roll_cluster(
     gpg_key: Option<&str>,
     apt_source: Option<&str>,
 ) -> Result<(), String> {
-    // Upgrade all mons in the cluster 1 by 1
     // Inspect the cluster health to make sure the mon upgrades were successful
-    // Upgrade all osds in the cluster 1 by 1
     // Inspect the cluster health to make sure the osd upgrades were successful
-    // Upgrade all mds in the cluster 1 by 1
-    // Upgrade all rgw in the cluster 1 by 1
     let mons: Vec<CephServer> = hosts
         .iter()
         .filter(|c| c.1 == CephType::Mon)
@@ -320,10 +320,7 @@ pub fn roll_cluster(
         gpg_key,
         apt_source,
     )?;
-    // TODO: Version specific upgrades
-    // Hammer -> Jewel requires a ceph.conf or a chown.
-    // Also requires a osd pool set param
-    // Jewel -> Luminous requires a osd pool set param to fence off old osds
+    // TODO: How can I do the final checks here??
     return Ok(());
 }
 
@@ -748,23 +745,26 @@ impl CephNode {
         ceph_type: &CephType,
     ) -> IOResult<()> {
         if from == &CephVersion::Hammer && to == &CephVersion::Jewel {
-            //setuser match path = /var/lib/ceph/$type/$cluster-$id
-            /*
-            // TODO: Only if we're going from CephVersion::Hammer -> CephVersion::Jewel
-            // Make sure the correct user owns the file.
-            update_owner(
-                &Path::new(&format!("/var/lib/ceph/osd/ceph-{}", child)),
-                true,
-            )?;
-            */
             debug!("Hammer -> Jewel specific");
             // For a given ceph daemon type is there anything specific that needs doing before
             // it get restarted?
             match ceph_type {
-                _ => {}
+                &CephType::Mds => {}
+                &CephType::Mgr => {}
+                &CephType::Mon => {
+                
+                }
+                &CephType::Osd => {
+                    //setuser match path = /var/lib/ceph/$type/$cluster-$id
+                    debug!("Checking if osd owner needs updating");
+                    //update_owner(
+                     //   &Path::new(&format!("/var/lib/ceph/osd/ceph-{}", child)),
+                      //  true,
+                    //)?;
+                }
+                &CephType::Rgw => {}
             }
         } else if from == &CephVersion::Jewel && to == &CephVersion::Luminous {
-            //ceph osd set sortbitwise
             // ceph auth caps client.<ID> mon 'allow r, allow command "osd blacklist"'
             // osd '<existing OSD caps for user>'
             // Add or restart ceph-mgr daemons
@@ -774,7 +774,13 @@ impl CephNode {
             // For a given ceph daemon type is there anything specific that needs doing before
             // it get restarted?
             match ceph_type {
-                _ => {}
+                &CephType::Mds => {}
+                &CephType::Mgr => {}
+                &CephType::Mon => {
+                    // ceph osd set sortbitwise
+                }
+                &CephType::Osd => {}
+                &CephType::Rgw => {}
             }
         }
         Ok(())
@@ -859,20 +865,20 @@ fn ceph_release() -> IOResult<CephVersion> {
     }
 }
 
-fn ceph_user(c: CephVersion) -> String {
+fn ceph_user(c: &CephVersion) -> String {
     match c {
-        CephVersion::Dumpling => "root".into(),
-        CephVersion::Emperor => "root".into(),
-        CephVersion::Firefly => "root".into(),
-        CephVersion::Giant => "root".into(),
-        CephVersion::Hammer => "root".into(),
-        CephVersion::Infernalis => "ceph".into(),
-        CephVersion::Jewel => "ceph".into(),
-        CephVersion::Kraken => "ceph".into(),
-        CephVersion::Luminous => "ceph".into(),
+        &CephVersion::Dumpling => "root".into(),
+        &CephVersion::Emperor => "root".into(),
+        &CephVersion::Firefly => "root".into(),
+        &CephVersion::Giant => "root".into(),
+        &CephVersion::Hammer => "root".into(),
+        &CephVersion::Infernalis => "ceph".into(),
+        &CephVersion::Jewel => "ceph".into(),
+        &CephVersion::Kraken => "ceph".into(),
+        &CephVersion::Luminous => "ceph".into(),
 
         //TODO what should we return here?.  I can't figure out what the ceph version is
-        CephVersion::Unknown => "root".into(),
+        &CephVersion::Unknown => "root".into(),
     }
 }
 
@@ -881,26 +887,20 @@ fn ceph_user(c: CephVersion) -> String {
 ///using the system's native chown functionality. This may take awhile,
 ///so this method will issue a set_status for any changes of ownership which
 ///recurses into directory structures.
-fn update_owner(path: &Path, recurse_dirs: bool) -> IOResult<()> {
-    let release = ceph_release()?;
+fn update_owner(path: &Path, recurse_dirs: bool, release: &CephVersion) -> IOResult<()> {
     let user = ceph_user(release);
-    let user_group = format!("{ceph_user}:{ceph_user}", ceph_user = user);
-    debug!("Changing ownership of {:?} to {}", path, user_group);
-    let mut cmd: Vec<String> = vec![
-        "chown".into(),
-        user_group.clone(),
-        path.to_string_lossy().into_owned(),
-    ];
-    if metadata(path)?.is_dir() && recurse_dirs {
-        cmd.insert(1, "-R".into());
-    }
+    let uid = match get_user_by_name(&user){
+        Some(user) => user,
+        None => {return Err(Error::new(ErrorKind::Other, format!("uid for {} not found", user)));}
+    };
+    debug!("Changing ownership of {:?} to {}", path, user);
     let start = SystemTime::now();
-    let chown_cmd = Command::new("chown")
-        .args(&[user_group.clone(), path.to_string_lossy().into_owned()])
-        .output()?;
-    debug!("chown cmd: {:?}", chown_cmd);
-    if !chown_cmd.status.success() {
-        return Err(::std::io::Error::last_os_error());
+    if recurse_dirs {
+        for entry in WalkDir::new(path) {
+            chown(entry?.path(), Some(Uid::from_raw(uid.uid())), Some(Gid::from_raw(uid.primary_group_id()))).map_err(|e| Error::new(ErrorKind::Other, e))?;
+        }
+    }else{
+        chown(path, Some(Uid::from_raw(uid.uid())), Some(Gid::from_raw(uid.primary_group_id()))).map_err(|e| Error::new(ErrorKind::Other, e))?;
     }
     let elapsed_time = start.duration_since(start).map_err(|e| {
         Error::new(ErrorKind::Other, e)
