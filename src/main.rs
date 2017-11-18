@@ -16,8 +16,9 @@ extern crate zmq;
 mod apt;
 mod ceph_upgrade;
 
+use std::fs::File;
 use std::ffi::OsStr;
-use std::io::{Error, ErrorKind};
+use std::io::{Error, ErrorKind, Read};
 use std::io::Result as IOResult;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -644,6 +645,20 @@ fn upgrade_request(
     }
 }
 
+fn owned_hostname(s: &str) -> Result<bool, String> {
+    let my_hostname = {
+        let mut buff = String::new();
+        let mut f = File::open("/etc/hostname").map_err(|e| e.to_string())?;
+        f.read_to_string(&mut buff).map_err(|e| e.to_string())?;
+        buff
+    };
+    if my_hostname == s || my_hostname.contains(s) {
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
 fn owned_ip(s: &str) -> Result<bool, String> {
     debug!("owned_ip: {}", s);
     let my_netifaces = Interface::get_all().map_err(|e| e.to_string())?;
@@ -669,11 +684,16 @@ fn scp_binary(
     binary_name: &OsStr,
     payload: &PathBuf,
     ssh_user: &Option<&str>,
+    ssh_identity: &Option<&str>,
     host: (&str, u16),
 ) -> IOResult<()> {
     info!("Binary: {:?}", binary_name);
     info!("Uploading {} to {}:{}", payload.display(), host.0, host.1);
     let mut c = Command::new("scp");
+    if let &Some(ssh_identity) = ssh_identity {
+        c.arg("-i");
+        c.arg(ssh_identity);
+    }
     c.arg("-P");
     c.arg(&host.1.to_string());
     c.arg(&format!("{}", payload.display()));
@@ -698,6 +718,7 @@ fn scp_binary(
 fn start_binary(
     binary_name: &OsStr,
     ssh_user: &Option<&str>,
+    ssh_identity: &Option<&str>,
     host: (&str, u16),
     listen_port: u16,
     version: &DebianVersion,
@@ -707,6 +728,10 @@ fn start_binary(
     repo_source: Option<&str>,
 ) -> IOResult<()> {
     let mut run = Command::new("ssh");
+    if let &Some(ssh_identity) = ssh_identity {
+        run.arg("-i");
+        run.arg(ssh_identity);
+    }
     run.arg("-p");
     run.arg(&host.1.to_string());
     if let &Some(ssh_user) = ssh_user {
@@ -753,6 +778,7 @@ fn start_binary(
 // host: (address, ssh port), skynet listen port
 fn upload_and_execute(
     ssh_user: Option<&str>,
+    ssh_identity: Option<&str>,
     host: (String, u16),
     listen_port: u16,
     version: &DebianVersion,
@@ -773,11 +799,18 @@ fn upload_and_execute(
         )
         .map_err(|e| Error::new(ErrorKind::Other, e))?;
     info!("Uploading to {}", host.0);
-    scp_binary(&binary_name, &payload, &ssh_user, (&host.0, host.1))?;
+    scp_binary(
+        &binary_name,
+        &payload,
+        &ssh_user,
+        &ssh_identity,
+        (&host.0, host.1),
+    )?;
     info!("Starting skynet on {}", host.0);
     start_binary(
         &binary_name,
         &ssh_user,
+        &ssh_identity,
         (&host.0, 22),
         listen_port,
         version,
@@ -804,11 +837,18 @@ fn upload_and_execute(
             continue;
         }
         info!("Uploading to {}", h.get_addr());
-        let res = scp_binary(&binary_name, &payload, &ssh_user, (h.get_addr(), 22));
+        let res = scp_binary(
+            &binary_name,
+            &payload,
+            &ssh_user,
+            &ssh_identity,
+            (h.get_addr(), 22),
+        );
         info!("scp: {:?}", res);
         start_binary(
             &binary_name,
             &ssh_user,
+            &ssh_identity,
             (h.get_addr(), 22),
             listen_port,
             version,
@@ -920,6 +960,7 @@ fn main() {
     if let Some(host) = host {
         if let Ok(mut s) = upload_and_execute(
             ssh_user,
+            ssh_identity,
             (host.to_string(), 22),
             port,
             &v,

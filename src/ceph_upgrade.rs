@@ -31,15 +31,17 @@ use super::os_type;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CephType {
+    Mds,
+    Mgr,
     Mon,
     Osd,
-    Mds,
     Rgw,
 }
 
 impl fmt::Display for CephType {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
+            &CephType::Mgr => write!(f, "Mgr"),
             &CephType::Mds => write!(f, "Mds"),
             &CephType::Mon => write!(f, "Mon"),
             &CephType::Osd => write!(f, "Osd"),
@@ -51,6 +53,7 @@ impl fmt::Display for CephType {
 impl From<CephComponent> for CephType {
     fn from(c: CephComponent) -> Self {
         match c {
+            CephComponent::Mgr => CephType::Mgr,
             CephComponent::Mon => CephType::Mon,
             CephComponent::Osd => CephType::Osd,
             CephComponent::Mds => CephType::Mds,
@@ -62,6 +65,7 @@ impl From<CephComponent> for CephType {
 impl From<CephType> for CephComponent {
     fn from(c: CephType) -> Self {
         match c {
+            CephType::Mgr => CephComponent::Mgr,
             CephType::Mon => CephComponent::Mon,
             CephType::Osd => CephComponent::Osd,
             CephType::Mds => CephComponent::Mds,
@@ -191,8 +195,7 @@ fn connect_and_upgrade(
         // First check if I own this ip address. If so then skip the RPC request
         let owned_ip = match super::owned_ip(&s.addr) {
             Ok(result) => result,
-            // Ignore errors for now.  Osds use hostnames and mons use ip's
-            Err(_) => false,
+            Err(_) => super::owned_hostname(&s.addr).unwrap_or(false),
         };
         if owned_ip {
             let node = CephNode::new();
@@ -317,6 +320,10 @@ pub fn roll_cluster(
         gpg_key,
         apt_source,
     )?;
+    // TODO: Version specific upgrades
+    // Hammer -> Jewel requires a ceph.conf or a chown.
+    // Also requires a osd pool set param
+    // Jewel -> Luminous requires a osd pool set param to fence off old osds
     return Ok(());
 }
 
@@ -342,6 +349,7 @@ impl CephNode {
             apt::get_installed_package_version("ceph")?,
             version
         );
+        let from_release = ceph_release().map_err(|e| e.to_string())?;
         let handle = connect_to_ceph("admin", "/etc/ceph/ceph.conf").map_err(
             |e| {
                 e.to_string()
@@ -367,46 +375,64 @@ impl CephNode {
                 )?;
             }
         }
+        // Update our repo information
+        apt::apt_update().map_err(|e| e.to_string())?;
+        // Upgrade the node
         self.upgrade(version).map_err(|e| e.to_string())?;
         restore_conf_files(&backed_files).map_err(|e| e.to_string())?;
-        debug!("Setting noout, nodown to prevent cluster rebuilding");
-        osd_set(handle, "noout", false, false).map_err(
-            |e| e.to_string(),
-        )?;
-        osd_set(handle, "nodown", false, false).map_err(
-            |e| e.to_string(),
-        )?;
+        // Record which release we upgraded to
+        let to_release = ceph_release().map_err(|e| e.to_string())?;
+
         match c {
+            CephComponent::Mgr => {}
+            CephComponent::Mds => {
+                debug!("Performing possible release specific mds changes");
+                self.release_specific(&from_release, &to_release, &CephType::Mds)
+                    .map_err(|e| e.to_string())?;
+                debug!("Restarting mds");
+                self.restart_mds().map_err(|e| e.to_string())?;
+            }
             CephComponent::Mon => {
+                debug!("Performing possible release specific mon changes");
+                self.release_specific(&from_release, &to_release, &CephType::Mon)
+                    .map_err(|e| e.to_string())?;
                 debug!("Restarting mon");
                 self.restart_mon().map_err(|e| e.to_string())?;
             }
             CephComponent::Osd => {
+                debug!("Performing possible release specific osd changes");
+                self.release_specific(&from_release, &to_release, &CephType::Osd)
+                    .map_err(|e| e.to_string())?;
                 debug!("Restarting osd");
+                debug!("Setting noout, nodown to prevent cluster rebuilding");
+                osd_set(handle, "noout", false, false).map_err(
+                    |e| e.to_string(),
+                )?;
+                osd_set(handle, "nodown", false, false).map_err(
+                    |e| e.to_string(),
+                )?;
                 self.restart_osd().map_err(|e| e.to_string())?;
+                debug!("Unsetting noout, nodown");
+                osd_unset(handle, "noout", false).map_err(|e| e.to_string())?;
+                osd_unset(handle, "nodown", false).map_err(
+                    |e| e.to_string(),
+                )?;
             }
             CephComponent::Rgw => {
+                debug!("Performing possible release specific rgw changes");
+                self.release_specific(&from_release, &to_release, &CephType::Rgw)
+                    .map_err(|e| e.to_string())?;
                 debug!("Restarting rgw");
                 self.restart_rgw().map_err(|e| e.to_string())?;
             }
-            CephComponent::Mds => {
-                debug!("Restarting mds");
-                self.restart_mds().map_err(|e| e.to_string())?;
-            }
         };
-        debug!("Unsetting noout, nodown");
-        osd_unset(handle, "noout", false).map_err(|e| e.to_string())?;
-        osd_unset(handle, "nodown", false).map_err(
-            |e| e.to_string(),
-        )?;
 
         return Ok(());
     }
 
-    fn upgrade(&self, version: &ApiVersion) -> IOResult<()> {
+    fn upgrade(&self, from_version: &ApiVersion) -> IOResult<()> {
         info!("Beginning upgrade procedure");
         //basic upgrade things that all nodes need to do
-        apt::apt_update()?;
 
         // debian version
         let candidate = apt::get_candidate_package_version("ceph").map_err(|e| {
@@ -414,11 +440,11 @@ impl CephNode {
         })?;
         let candidate_version = super::version_to_protobuf(&candidate);
 
-        if version != &candidate_version {
+        if from_version != &candidate_version {
             error!(
                 "Candidate version {:?} doesn't match requested version: {:?}",
                 candidate_version,
-                version
+                from_version
             );
             // TODO: Should we abort the upgrade if the requested version isn't matching?
         }
@@ -506,7 +532,8 @@ impl CephNode {
             let mut f = File::open("/etc/hostname")?;
             let mut buff = String::new();
             f.read_to_string(&mut buff)?;
-            buff
+            // /etc/hostname seems to have a trailing \n
+            buff.trim().to_string()
         };
         let h = connect_to_ceph("admin", "/etc/ceph/ceph.conf").map_err(
             |e| {
@@ -516,26 +543,24 @@ impl CephNode {
         let osd_tree = ceph_rust::cmd::osd_tree(h).map_err(|e| {
             Error::new(ErrorKind::Other, e)
         })?;
+        debug!("osd_tree: {:?}", osd_tree);
         // This should filter down to 1 node
         let hosts: Vec<&ceph_rust::cmd::CrushNode> = osd_tree
             .nodes
             .iter()
             .filter(|n| n.crush_type == "host" && n.name == hostname)
             .collect();
+        debug!("restart osd hosts: {:?}", hosts);
 
         match hosts.first() {
             Some(host) => {
                 if let Some(ref children) = host.children {
                     debug!("Found osds: {:?} for host: {}", children, hostname);
                     for child in children {
-                        // stop osd
                         self.stop_osd(*child)?;
-                        // Check if these packages exist and remove all
-                        self.disable_osd(0)?;
-
-                        // Only if we're going from CephVersion::Hammer -> CephVersion::Jewel
-                        // Make sure the correct user owns the file.
-                        update_owner(&Path::new(&format!("/var/lib/ceph/osd-{}", child)), true)?;
+                        // TODO: Is it necessary disable and enable?
+                        // if the upgrade is interrupted with a server crash what should skynet do?
+                        self.disable_osd(*child)?;
                         self.enable_osd(*child)?;
                         self.start_osd(*child)?;
                     }
@@ -606,7 +631,7 @@ impl CephNode {
     ///next reboot of the system. Due to differences between init systems,
     ///this method cannot make any guarantees that the specified osd cannot be
     ///started manually.
-    fn disable_osd(&self, osd_num: u64) -> IOResult<()> {
+    fn disable_osd(&self, osd_num: i64) -> IOResult<()> {
         debug!("Disabling osd: {}", osd_num);
         let init_daemon = detect_daemon().map_err(|e| Error::new(ErrorKind::Other, e))?;
         match init_daemon {
@@ -622,6 +647,7 @@ impl CephNode {
                 let output = Command::new("systemctl")
                     .args(&["disable", &format!("ceph-osd@{}", osd_num)])
                     .output()?;
+                trace!("disable: {:?}", output);
                 if !output.status.success() {
                     return Err(Error::last_os_error());
                 }
@@ -634,9 +660,8 @@ impl CephNode {
                 // 'ready' file in the OSD's root directory. This is due to the
                 // ceph-osd-all upstart script checking for the presence of this file
                 // before starting the OSD.
-                let ready_file: PathBuf = ["/var/lib/ceph", &format!("ceph-{}", osd_num), "ready"]
-                    .iter()
-                    .collect();
+                let ready_file = PathBuf::from(format!("/var/lib/ceph/osd/ceph-{}/ready", osd_num));
+                debug!("Removing upstart osd ready file: {}", ready_file.display());
                 if ready_file.exists() {
                     remove_file(ready_file)?;
                 }
@@ -663,6 +688,7 @@ impl CephNode {
                 let output = Command::new("systemctl")
                     .args(&["enable", &format!("ceph-osd@{}", osd_num)])
                     .output()?;
+                trace!("enable: {:?}", output);
                 if !output.status.success() {
                     return Err(Error::last_os_error());
                 }
@@ -671,12 +697,10 @@ impl CephNode {
                 // When running on upstart, the OSDs are started via the ceph-osd-all
                 // upstart script which will only start the osd if it has a 'ready'
                 // file. Make sure that file exists.
-                let ready_file_path: PathBuf =
-                    ["/var/lib/ceph", &format!("ceph-{}", osd_num), "ready"]
-                        .iter()
-                        .collect();
-                let mut file = File::create(&ready_file_path)?;
-                file.write_all(b"ready")?;
+                let ready_file = PathBuf::from(format!("/var/lib/ceph/osd/ceph-{}/ready", osd_num));
+                debug!("Restoring upstart osd ready file: {}", ready_file.display());
+                let mut file = File::create(&ready_file)?;
+                file.write_all(b"ready\n")?;
             }
             _ => {
                 return Err(Error::new(
@@ -716,6 +740,45 @@ impl CephNode {
         }
         Ok(ceph_processes)
     }
+
+    fn release_specific(
+        &self,
+        from: &CephVersion,
+        to: &CephVersion,
+        ceph_type: &CephType,
+    ) -> IOResult<()> {
+        if from == &CephVersion::Hammer && to == &CephVersion::Jewel {
+            //setuser match path = /var/lib/ceph/$type/$cluster-$id
+            /*
+            // TODO: Only if we're going from CephVersion::Hammer -> CephVersion::Jewel
+            // Make sure the correct user owns the file.
+            update_owner(
+                &Path::new(&format!("/var/lib/ceph/osd/ceph-{}", child)),
+                true,
+            )?;
+            */
+            debug!("Hammer -> Jewel specific");
+            // For a given ceph daemon type is there anything specific that needs doing before
+            // it get restarted?
+            match ceph_type {
+                _ => {}
+            }
+        } else if from == &CephVersion::Jewel && to == &CephVersion::Luminous {
+            //ceph osd set sortbitwise
+            // ceph auth caps client.<ID> mon 'allow r, allow command "osd blacklist"'
+            // osd '<existing OSD caps for user>'
+            // Add or restart ceph-mgr daemons
+            // ceph osd require-osd-release luminous
+
+            debug!("Jewel -> Luminous specific");
+            // For a given ceph daemon type is there anything specific that needs doing before
+            // it get restarted?
+            match ceph_type {
+                _ => {}
+            }
+        }
+        Ok(())
+    }
 }
 
 // Search around for a ceph socket
@@ -742,6 +805,11 @@ fn find_socket(c: &CephType) -> IOResult<PathBuf> {
                 }
                 &CephType::Rgw => {
                     if entry.file_name().to_string_lossy().starts_with("ceph-rgw") {
+                        return Ok(entry.path());
+                    }
+                }
+                &CephType::Mgr => {
+                    if entry.file_name().to_string_lossy().starts_with("ceph-mgr") {
                         return Ok(entry.path());
                     }
                 }
@@ -827,10 +895,16 @@ fn update_owner(path: &Path, recurse_dirs: bool) -> IOResult<()> {
         cmd.insert(1, "-R".into());
     }
     let start = SystemTime::now();
-    Command::new("chown")
+    let chown_cmd = Command::new("chown")
         .args(&[user_group.clone(), path.to_string_lossy().into_owned()])
         .output()?;
-    let elapsed_time = start.duration_since(start).unwrap();
+    debug!("chown cmd: {:?}", chown_cmd);
+    if !chown_cmd.status.success() {
+        return Err(::std::io::Error::last_os_error());
+    }
+    let elapsed_time = start.duration_since(start).map_err(|e| {
+        Error::new(ErrorKind::Other, e)
+    })?;
 
     debug!(
         "Took {} seconds to change the ownership of path: {:?}",
