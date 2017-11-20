@@ -92,6 +92,23 @@ enum CephVersion {
     Unknown,
 }
 
+impl fmt::Display for CephVersion {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            &CephVersion::Dumpling => write!(f, "Dumpling"),
+            &CephVersion::Emperor => write!(f, "Emperor"),
+            &CephVersion::Firefly => write!(f, "Firefly"),
+            &CephVersion::Giant => write!(f, "Giant"),
+            &CephVersion::Hammer => write!(f, "Hammer"),
+            &CephVersion::Infernalis => write!(f, "Infernalis"),
+            &CephVersion::Jewel => write!(f, "Jewel"),
+            &CephVersion::Kraken => write!(f, "Kraken"),
+            &CephVersion::Luminous => write!(f, "Luminous"),
+            &CephVersion::Unknown => write!(f, "Unknown"),
+        }
+    }
+}
+
 /// A server.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CephServer {
@@ -107,13 +124,17 @@ pub struct CephNode {
 
 fn semver_from_debian_version(v: &Version) -> IOResult<SemVer> {
     let mut buff = String::new();
-    for element in v.clone().upstream_version.elements {
-        buff.push_str(&format!("{}", element.numeric));
+    let mut elements = v.clone().upstream_version.elements;
+    buff.push_str(&format!("{}", elements.remove(0).numeric));
+
+    for element in elements {
         buff.push_str(&element.alpha);
+        buff.push_str(&format!("{}", element.numeric));
     }
     let vers = semver::Version::parse(&buff).map_err(|e| {
         Error::new(ErrorKind::Other, e)
     })?;
+    debug!("semver vers: {}", vers);
     Ok(vers)
 }
 
@@ -202,6 +223,7 @@ fn connect_and_upgrade(
             Err(_) => super::owned_hostname(&s.addr).unwrap_or(false),
         };
         if owned_ip {
+            debug!("Upgrading myself");
             let node = CephNode::new();
             match node.upgrade_node(
                 //ApiVersion::from(new_version),
@@ -347,12 +369,15 @@ impl CephNode {
             version
         );
         let from_release = ceph_release().map_err(|e| e.to_string())?;
+        debug!("from_release: {}", from_release);
         let handle = connect_to_ceph("admin", "/etc/ceph/ceph.conf").map_err(
             |e| {
                 e.to_string()
             },
         )?;
+        debug!("Connected to ceph: {:?}", handle);
         let backed_files = backup_conf_files().map_err(|e| e.to_string())?;
+        debug!("Backed up conf files: {:?}", backed_files);
 
         if let Some(gpg_key) = gpg_key {
             debug!("Adding gpg key: {}", gpg_key);
@@ -751,15 +776,13 @@ impl CephNode {
             match ceph_type {
                 &CephType::Mds => {}
                 &CephType::Mgr => {}
-                &CephType::Mon => {
-                
-                }
+                &CephType::Mon => {}
                 &CephType::Osd => {
                     //setuser match path = /var/lib/ceph/$type/$cluster-$id
                     debug!("Checking if osd owner needs updating");
                     //update_owner(
-                     //   &Path::new(&format!("/var/lib/ceph/osd/ceph-{}", child)),
-                      //  true,
+                    //   &Path::new(&format!("/var/lib/ceph/osd/ceph-{}", child)),
+                    //  true,
                     //)?;
                 }
                 &CephType::Rgw => {}
@@ -842,10 +865,14 @@ pub fn get_running_version(c: &CephType) -> IOResult<SemVer> {
 }
 
 fn ceph_release() -> IOResult<CephVersion> {
+    debug!("Getting ceph release");
     let v = apt::get_installed_package_version("ceph").map_err(|e| {
+        error!("get_installed_package_version failed: {:?}", e);
         Error::new(ErrorKind::Other, e)
     })?;
+    debug!("apt installed version: {}", v);
     let ceph_version = semver_from_debian_version(&v)?;
+    debug!("ceph version: {}", ceph_version);
     match ceph_version.major {
         0 => {
             match ceph_version.minor {
@@ -889,18 +916,31 @@ fn ceph_user(c: &CephVersion) -> String {
 ///recurses into directory structures.
 fn update_owner(path: &Path, recurse_dirs: bool, release: &CephVersion) -> IOResult<()> {
     let user = ceph_user(release);
-    let uid = match get_user_by_name(&user){
+    let uid = match get_user_by_name(&user) {
         Some(user) => user,
-        None => {return Err(Error::new(ErrorKind::Other, format!("uid for {} not found", user)));}
+        None => {
+            return Err(Error::new(
+                ErrorKind::Other,
+                format!("uid for {} not found", user),
+            ));
+        }
     };
     debug!("Changing ownership of {:?} to {}", path, user);
     let start = SystemTime::now();
     if recurse_dirs {
         for entry in WalkDir::new(path) {
-            chown(entry?.path(), Some(Uid::from_raw(uid.uid())), Some(Gid::from_raw(uid.primary_group_id()))).map_err(|e| Error::new(ErrorKind::Other, e))?;
+            chown(
+                entry?.path(),
+                Some(Uid::from_raw(uid.uid())),
+                Some(Gid::from_raw(uid.primary_group_id())),
+            ).map_err(|e| Error::new(ErrorKind::Other, e))?;
         }
-    }else{
-        chown(path, Some(Uid::from_raw(uid.uid())), Some(Gid::from_raw(uid.primary_group_id()))).map_err(|e| Error::new(ErrorKind::Other, e))?;
+    } else {
+        chown(
+            path,
+            Some(Uid::from_raw(uid.uid())),
+            Some(Gid::from_raw(uid.primary_group_id())),
+        ).map_err(|e| Error::new(ErrorKind::Other, e))?;
     }
     let elapsed_time = start.duration_since(start).map_err(|e| {
         Error::new(ErrorKind::Other, e)

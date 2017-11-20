@@ -6,11 +6,12 @@ license = "MIT"
 
 [dependencies]
 api = { path = "api" }
-apt-pkg-native = { git = "https://github.com/FauxFaux/apt-pkg-native-rs" }
+apt-pkg-native = "*"
 ceph-rust = {path = "/home/chris/repos/ceph-rust" } #"~0.1"
 clap = "*"
 chrono = { version = "~0.4", features = ["rustc-serialize"] }
 debian = {git = "https://github.com/mwanner/rust-debian" }
+dns-lookup = "*"
 error-chain = "0.10.0"
 ifaces = "*"
 init-daemon = "*"

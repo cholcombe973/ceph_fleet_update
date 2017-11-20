@@ -2,6 +2,7 @@ extern crate api;
 #[macro_use]
 extern crate clap;
 extern crate debian;
+extern crate dns_lookup;
 extern crate ifaces;
 #[macro_use]
 extern crate log;
@@ -18,11 +19,11 @@ mod ceph_upgrade;
 
 use std::fs::File;
 use std::ffi::OsStr;
-use std::io::{Error, ErrorKind, Read};
+use std::io::{Error, ErrorKind, Read, Write};
 use std::io::Result as IOResult;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::str::FromStr;
 use std::thread;
 use std::time;
@@ -33,6 +34,7 @@ use api::service::{CephComponent, CephServer, HostResult, Op, Operation, ResultT
 use ceph_upgrade::{get_running_version, CephType, CephNode};
 use clap::{Arg, App};
 use debian::version::Version as DebianVersion;
+use dns_lookup::lookup_host;
 use ifaces::Interface;
 use protobuf::Message as ProtobufMsg;
 use protobuf::core::parse_from_bytes;
@@ -115,7 +117,6 @@ fn listen(
                 {
                     error!("Get running version error: {:?}", e);
                 }
-
             }
             Op::Upgrade => {
                 if !operation.has_version() {
@@ -418,9 +419,11 @@ fn handle_upgrade(
         apt_source,
     ) {
         Ok(_) => {
+            debug!("Upgrading went OK");
             result.set_result(ResultType::OK);
         }
         Err(e) => {
+            error!("Upgrading failed: {}", e.to_string());
             result.set_result(ResultType::ERR);
             result.set_error_msg(e.to_string());
         }
@@ -627,6 +630,7 @@ fn upgrade_request(
     debug!("Decoding msg len: {}", upgrade_response.len());
     let op_result = parse_from_bytes::<api::service::OpResult>(&upgrade_response)
         .map_err(|e| e.to_string())?;
+    debug!("op_result: {:?}", op_result);
     match op_result.get_result() {
         ResultType::OK => {
             debug!("Upgrade successful");
@@ -650,7 +654,7 @@ fn owned_hostname(s: &str) -> Result<bool, String> {
         let mut buff = String::new();
         let mut f = File::open("/etc/hostname").map_err(|e| e.to_string())?;
         f.read_to_string(&mut buff).map_err(|e| e.to_string())?;
-        buff
+        buff.trim().to_string()
     };
     if my_hostname == s || my_hostname.contains(s) {
         Ok(true)
@@ -719,6 +723,7 @@ fn start_binary(
     binary_name: &OsStr,
     ssh_user: &Option<&str>,
     ssh_identity: &Option<&str>,
+    sudo_password: &Option<&str>,
     host: (&str, u16),
     listen_port: u16,
     version: &DebianVersion,
@@ -739,10 +744,19 @@ fn start_binary(
     } else {
         run.arg(host.0);
     }
+    if sudo_password.is_some() {
+        debug!("Setting stdin and stdout to piped");
+        run.stdin(Stdio::piped());
+        run.stdout(Stdio::piped());
+        run.arg("nohup");
+        run.arg("sudo");
+        run.arg("-S");
+    } else {
+        run.arg("nohup");
+        run.arg("sudo");
+    }
     run.args(
         &[
-            "nohup",
-            "sudo",
             &format!("./{}", binary_name.to_string_lossy()),
             "--port",
             &listen_port.to_string(),
@@ -767,10 +781,17 @@ fn start_binary(
         run.arg("--reposource");
         run.arg(repo_source);
     }
-    run.args(&["2>&1 > skynet.log", "&"]);
-
-    run.spawn()?;
+    run.args(&["2>&1 > skynet.log"]);
     debug!("ssh: {:?}", run);
+
+    let child = run.spawn()?;
+    if let &Some(sudo_password) = sudo_password {
+        debug!("Handling sudo password");
+        if let Some(mut stdin) = child.stdin {
+            debug!("Writing sudo password to stdin");
+            stdin.write_all(&format!("{}\n", sudo_password).as_bytes())?;
+        }
+    }
     thread::sleep(time::Duration::from_secs(1));
     Ok(())
 }
@@ -779,6 +800,7 @@ fn start_binary(
 fn upload_and_execute(
     ssh_user: Option<&str>,
     ssh_identity: Option<&str>,
+    sudo_password: Option<&str>,
     host: (String, u16),
     listen_port: u16,
     version: &DebianVersion,
@@ -811,6 +833,7 @@ fn upload_and_execute(
         &binary_name,
         &ssh_user,
         &ssh_identity,
+        &sudo_password,
         (&host.0, 22),
         listen_port,
         version,
@@ -830,8 +853,26 @@ fn upload_and_execute(
         Error::new(ErrorKind::Other, e)
     })?;
     debug!("Cluster hosts: {:?}", cluster_hosts);
-    for h in cluster_hosts {
+    'hosts: for h in cluster_hosts {
         info!("finished_hosts: {:?}", finished_hosts);
+        let ips: Vec<IpAddr> = lookup_host(h.get_addr())?;
+        for ip in ips {
+            match ip {
+                IpAddr::V4(v4_addr) => {
+                    if finished_hosts.contains(&v4_addr.to_string()) {
+                        info!("Host already finished.  Skipping");
+                        continue 'hosts;
+                    }
+                }
+                IpAddr::V6(v6_addr) => {
+                    if finished_hosts.contains(&v6_addr.to_string()) {
+                        info!("Host already finished.  Skipping");
+                        continue 'hosts;
+                    }
+                }
+            }
+        }
+
         if finished_hosts.contains(&h.get_addr().to_string()) {
             info!("Host already finished.  Skipping");
             continue;
@@ -849,6 +890,7 @@ fn upload_and_execute(
             &binary_name,
             &ssh_user,
             &ssh_identity,
+            &sudo_password,
             (h.get_addr(), 22),
             listen_port,
             version,
@@ -932,6 +974,13 @@ fn main() {
                 .takes_value(true)
                 .required(false),
         )
+        .arg(
+            Arg::with_name("sudo_password")
+                .help("Sudo password to use")
+                .long("sudopassword")
+                .takes_value(true)
+                .required(false),
+        )
         .arg(Arg::with_name("v").short("v").multiple(true).help(
             "Sets the level of verbosity",
         ))
@@ -952,6 +1001,7 @@ fn main() {
     let port = u16::from_str(matches.value_of("port").expect("port option missing")).unwrap();
     let ssh_user = matches.value_of("ssh_user");
     let ssh_identity = matches.value_of("ssh_identity");
+    let sudo_password = matches.value_of("sudo_password");
     let v = DebianVersion::parse(matches.value_of("version").expect("version option missing"))
         .unwrap();
     debug!("version requested: {:?}", v);
@@ -961,6 +1011,7 @@ fn main() {
         if let Ok(mut s) = upload_and_execute(
             ssh_user,
             ssh_identity,
+            sudo_password,
             (host.to_string(), 22),
             port,
             &v,
