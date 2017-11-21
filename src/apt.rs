@@ -154,6 +154,7 @@ pub fn get_candidate_package_version(package_name: &str) -> Result<Version, Stri
 
 pub fn get_installed_package_version(package_name: &str) -> Result<Version, String> {
     let mut cache = Cache::get_singleton();
+    cache.reload();
     let mut found = cache.find_by_name(package_name);
 
     if let Some(view) = found.next() {

@@ -400,7 +400,9 @@ impl CephNode {
         // Update our repo information
         apt::apt_update().map_err(|e| e.to_string())?;
         // Upgrade the node
-        self.upgrade(version).map_err(|e| e.to_string())?;
+        self.upgrade(&CephType::from(c), version).map_err(
+            |e| e.to_string(),
+        )?;
         restore_conf_files(&backed_files).map_err(|e| e.to_string())?;
         // Record which release we upgraded to
         let to_release = ceph_release().map_err(|e| e.to_string())?;
@@ -452,7 +454,7 @@ impl CephNode {
         return Ok(());
     }
 
-    fn upgrade(&self, from_version: &ApiVersion) -> IOResult<()> {
+    fn upgrade(&self, c: &CephType, from_version: &ApiVersion) -> IOResult<()> {
         info!("Beginning upgrade procedure");
         //basic upgrade things that all nodes need to do
 
@@ -470,7 +472,25 @@ impl CephNode {
             );
             // TODO: Should we abort the upgrade if the requested version isn't matching?
         }
+        let deb_installed_version = apt::get_installed_package_version("ceph").map_err(|e| {
+            Error::new(ErrorKind::Other, e)
+        })?;
+        let installed_version = semver_from_debian_version(&deb_installed_version)?;
+        debug!("installed_version: {}", installed_version);
+        let running_version = get_running_version(c)?;
+        debug!("running_version: {}", running_version);
 
+        // Collocated ceph services.  IE Mon + OSD.  Mon was already upgraded.
+        // Now we just need to restart the osd.
+        if installed_version >= running_version {
+            debug!("Installed version of ceph > than running version");
+            // Return early
+            return Ok(());
+        }
+
+        // All other cases require an upgrade of installed ceph packages
+        // TODO: Put this behind a feature flag.  This is probably overkill
+        // except on broken systems.
         apt::apt_remove(vec![
             "ceph",
             "ceph-base",
@@ -812,10 +832,11 @@ impl CephNode {
 
 // Search around for a ceph socket
 fn find_socket(c: &CephType) -> IOResult<PathBuf> {
-    debug!("Opening /var/run/ceph to find sockets to connect to");
+    debug!("Opening /var/run/ceph to find {} sockets to connect to", c);
     let p = Path::new("/var/run/ceph");
     for entry in p.read_dir()? {
         if let Ok(entry) = entry {
+            trace!("dir entry: {:?}", entry);
             match c {
                 &CephType::Mon => {
                     if entry.file_name().to_string_lossy().starts_with("ceph-mon") {
@@ -851,16 +872,19 @@ fn find_socket(c: &CephType) -> IOResult<PathBuf> {
 // Get the running version of a ceph type ie Mon, Osd, etc
 pub fn get_running_version(c: &CephType) -> IOResult<SemVer> {
     let socket = find_socket(c).map_err(|e| Error::new(ErrorKind::Other, e))?;
-    let v = match ceph_version(&format!("/var/run/ceph/{}", socket.display())) {
+    debug!("Connecting to socket: {}", socket.display());
+    let v = match ceph_version(&format!("{}", socket.display())) {
         Some(v) => v,
         None => {
             error!("Unable to discover ceph version.  Can't discern correct user");
             return Err(Error::new(ErrorKind::Other, "Unable to find ceph version"));
         }
     };
+    debug!("ceph version from socket: {}", v);
     let ceph_version = SemVer::parse(&v).map_err(
         |e| Error::new(ErrorKind::Other, e),
     )?;
+    debug!("ceph version from semver: {}", ceph_version);
     Ok(ceph_version)
 }
 
