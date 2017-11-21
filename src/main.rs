@@ -93,6 +93,9 @@ fn listen(
                 {
                     error!("BecomeLeader error: {:?}", e);
                 }
+                info!("BecomeLeader finished");
+                // Exit after become leader is finished
+                return Ok(());
             }
             Op::ListHosts => {
                 if let Err(e) = handle_list_hosts(&mut responder) {
@@ -554,6 +557,19 @@ fn installed_version_request(s: &mut Socket) -> Result<Version, String> {
             }
         }
     }
+}
+
+fn stop_request(s: &mut Socket) -> Result<(), String> {
+    let mut o = Operation::new();
+    debug!("Creating stop operation request");
+    o.set_Op_type(Op::Stop);
+
+    let encoded = o.write_to_bytes().unwrap();
+    let msg = Message::from_slice(&encoded).map_err(|e| e.to_string())?;
+    debug!("Sending message");
+    s.send_msg(msg, 0).map_err(|e| e.to_string())?;
+
+    Ok(())
 }
 
 fn list_hosts_request(s: &mut Socket) -> Result<Vec<CephServer>, String> {
@@ -1031,6 +1047,7 @@ fn main() {
                 }
             };
         }
+        info!("Finished");
     } else {
         info!("I am a follower");
         //start up a listener

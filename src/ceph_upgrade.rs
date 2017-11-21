@@ -134,7 +134,6 @@ fn semver_from_debian_version(v: &Version) -> IOResult<SemVer> {
     let vers = semver::Version::parse(&buff).map_err(|e| {
         Error::new(ErrorKind::Other, e)
     })?;
-    debug!("semver vers: {}", vers);
     Ok(vers)
 }
 
@@ -343,6 +342,18 @@ pub fn roll_cluster(
         apt_source,
     )?;
     // TODO: How can I do the final checks here??
+    for host in hosts {
+        let mut req_socket = super::connect(&host.0.addr, port).map_err(
+            |e| e.to_string(),
+        )?;
+        let _ = super::stop_request(&mut req_socket);
+        debug!("Stop requested");
+        let ep = req_socket
+            .get_last_endpoint()
+            .map_err(|e| e.to_string())?
+            .unwrap();
+        req_socket.disconnect(&ep).map_err(|e| e.to_string())?;
+    }
     return Ok(());
 }
 
@@ -370,12 +381,7 @@ impl CephNode {
         );
         let from_release = ceph_release().map_err(|e| e.to_string())?;
         debug!("from_release: {}", from_release);
-        let handle = connect_to_ceph("admin", "/etc/ceph/ceph.conf").map_err(
-            |e| {
-                e.to_string()
-            },
-        )?;
-        debug!("Connected to ceph: {:?}", handle);
+
         let backed_files = backup_conf_files().map_err(|e| e.to_string())?;
         debug!("Backed up conf files: {:?}", backed_files);
 
@@ -400,118 +406,164 @@ impl CephNode {
         // Update our repo information
         apt::apt_update().map_err(|e| e.to_string())?;
         // Upgrade the node
-        self.upgrade(&CephType::from(c), version).map_err(
-            |e| e.to_string(),
+        self.upgrade(&CephType::from(c), &from_release).map_err(
+            |e| {
+                e.to_string()
+            },
         )?;
-        restore_conf_files(&backed_files).map_err(|e| e.to_string())?;
-        // Record which release we upgraded to
-        let to_release = ceph_release().map_err(|e| e.to_string())?;
-
-        match c {
-            CephComponent::Mgr => {}
-            CephComponent::Mds => {
-                debug!("Performing possible release specific mds changes");
-                self.release_specific(&from_release, &to_release, &CephType::Mds)
-                    .map_err(|e| e.to_string())?;
-                debug!("Restarting mds");
-                self.restart_mds().map_err(|e| e.to_string())?;
-            }
-            CephComponent::Mon => {
-                debug!("Performing possible release specific mon changes");
-                self.release_specific(&from_release, &to_release, &CephType::Mon)
-                    .map_err(|e| e.to_string())?;
-                debug!("Restarting mon");
-                self.restart_mon().map_err(|e| e.to_string())?;
-            }
-            CephComponent::Osd => {
-                debug!("Performing possible release specific osd changes");
-                self.release_specific(&from_release, &to_release, &CephType::Osd)
-                    .map_err(|e| e.to_string())?;
-                debug!("Restarting osd");
-                debug!("Setting noout, nodown to prevent cluster rebuilding");
-                osd_set(handle, "noout", false, false).map_err(
-                    |e| e.to_string(),
-                )?;
-                osd_set(handle, "nodown", false, false).map_err(
-                    |e| e.to_string(),
-                )?;
-                self.restart_osd().map_err(|e| e.to_string())?;
-                debug!("Unsetting noout, nodown");
-                osd_unset(handle, "noout", false).map_err(|e| e.to_string())?;
-                osd_unset(handle, "nodown", false).map_err(
-                    |e| e.to_string(),
-                )?;
-            }
-            CephComponent::Rgw => {
-                debug!("Performing possible release specific rgw changes");
-                self.release_specific(&from_release, &to_release, &CephType::Rgw)
-                    .map_err(|e| e.to_string())?;
-                debug!("Restarting rgw");
-                self.restart_rgw().map_err(|e| e.to_string())?;
-            }
-        };
-
         return Ok(());
     }
 
-    fn upgrade(&self, c: &CephType, from_version: &ApiVersion) -> IOResult<()> {
+    //basic upgrade things that all nodes need to do
+    fn upgrade(&self, c: &CephType, from_release: &CephVersion) -> IOResult<()> {
         info!("Beginning upgrade procedure");
-        //basic upgrade things that all nodes need to do
+        /*
+            3 cases:
+            1. candidate = 12.2.1   candidate > installed
+               installed = 10.0.2   installed == running
+               running   = 10.0.2   apt install + restart service
 
-        // debian version
+            2. candidate = 10.0.2  candidate == installed == running
+               installed = 10.0.2  Do nothing
+               running   = 10.0.2
+
+            3. candidate = 12.2.1  candidate == installed
+               installed = 12.2.1  installed > running
+               running   = 10.0.2  Restart service
+         */
         let candidate = apt::get_candidate_package_version("ceph").map_err(|e| {
             Error::new(ErrorKind::Other, e)
         })?;
-        let candidate_version = super::version_to_protobuf(&candidate);
-
-        if from_version != &candidate_version {
-            error!(
-                "Candidate version {:?} doesn't match requested version: {:?}",
-                candidate_version,
-                from_version
-            );
-            // TODO: Should we abort the upgrade if the requested version isn't matching?
-        }
-        let deb_installed_version = apt::get_installed_package_version("ceph").map_err(|e| {
+        let installed = apt::get_installed_package_version("ceph").map_err(|e| {
             Error::new(ErrorKind::Other, e)
         })?;
-        let installed_version = semver_from_debian_version(&deb_installed_version)?;
-        debug!("installed_version: {}", installed_version);
+        let candidate_version = semver_from_debian_version(&candidate)?;
+        let installed_version = semver_from_debian_version(&installed)?;
         let running_version = get_running_version(c)?;
+        debug!("candidate_version: {}", candidate_version);
+        debug!("installed_version: {}", installed_version);
         debug!("running_version: {}", running_version);
 
-        // Collocated ceph services.  IE Mon + OSD.  Mon was already upgraded.
-        // Now we just need to restart the osd.
-        if installed_version >= running_version {
-            debug!("Installed version of ceph > than running version");
-            // Return early
+        // Case 1
+        if candidate_version > installed_version && installed_version == running_version {
+            debug!("candidate_version > installed_version && installed_version == running_version");
+            //apt install + restart service
+
+            // TODO: Put this behind a feature flag.  This is probably overkill
+            // except on broken systems.
+            let backed_files = backup_conf_files()?;
+            debug!("Backed up conf files: {:?}", backed_files);
+
+            apt::apt_remove(vec![
+                "ceph",
+                "ceph-base",
+                "ceph-common",
+                "ceph-mds",
+                "ceph-mon",
+                "ceph-osd",
+                "libcephfs1",
+                "python-cephfs",
+                "python-rados",
+                "python-rbd",
+                "radosgw",
+                "librgw2",
+                "librbd1",
+                "libradosstriper1",
+                "librados2",
+            ]).map_err(|e| Error::new(ErrorKind::Other, e))?;
+
+            apt::apt_install(vec!["ceph"]).map_err(|e| {
+                Error::new(ErrorKind::Other, e)
+            })?;
+            restore_conf_files(&backed_files)?;
+            self.finish_upgrade(c, from_release)?;
             return Ok(());
         }
 
-        // All other cases require an upgrade of installed ceph packages
-        // TODO: Put this behind a feature flag.  This is probably overkill
-        // except on broken systems.
-        apt::apt_remove(vec![
-            "ceph",
-            "ceph-base",
-            "ceph-common",
-            "ceph-mds",
-            "ceph-mon",
-            "ceph-osd",
-            "libcephfs1",
-            "python-cephfs",
-            "python-rados",
-            "python-rbd",
-            "radosgw",
-            "librgw2",
-            "librbd1",
-            "libradosstriper1",
-            "librados2",
-        ]).map_err(|e| Error::new(ErrorKind::Other, e))?;
+        // Case 2
+        if candidate_version == installed_version && installed_version == running_version {
+            // Do nothing
+            debug!(
+                "candidate_version == installed_version && installed_version == running_version"
+            );
+            return Ok(());
+        }
+        // Case 3
+        if candidate_version == installed_version && installed_version > running_version {
+            debug!("candidate_version == installed_version && installed_version > running_version");
+            // Restart service
+            self.finish_upgrade(c, from_release)?;
+            return Ok(());
+        }
+        Ok(())
+    }
 
-        apt::apt_install(vec!["ceph"]).map_err(|e| {
-            Error::new(ErrorKind::Other, e)
-        })?;
+    fn finish_upgrade(&self, c: &CephType, from_release: &CephVersion) -> IOResult<()> {
+        // Record which release we upgraded to
+        let to_release = ceph_release()?;
+        let handle = connect_to_ceph("admin", "/etc/ceph/ceph.conf").map_err(
+            |e| {
+                Error::new(ErrorKind::Other, e)
+            },
+        )?;
+        debug!("Connected to ceph: {:?}", handle);
+        match c {
+            &CephType::Mgr => {}
+            &CephType::Mds => {
+                debug!("Performing possible release specific mds changes");
+                self.release_specific(
+                    &from_release,
+                    &to_release,
+                    &CephType::Mds,
+                )?;
+                debug!("Restarting mds");
+                self.restart_mds()?;
+            }
+            &CephType::Mon => {
+                debug!("Performing possible release specific mon changes");
+                self.release_specific(
+                    &from_release,
+                    &to_release,
+                    &CephType::Mon,
+                )?;
+                debug!("Restarting mon");
+                self.restart_mon()?;
+            }
+            &CephType::Osd => {
+                debug!("Performing possible release specific osd changes");
+                self.release_specific(
+                    &from_release,
+                    &to_release,
+                    &CephType::Osd,
+                )?;
+                debug!("Restarting osd");
+                debug!("Setting noout, nodown to prevent cluster rebuilding");
+                osd_set(handle, "noout", false, false).map_err(|e| {
+                    Error::new(ErrorKind::Other, e)
+                })?;
+                osd_set(handle, "nodown", false, false).map_err(|e| {
+                    Error::new(ErrorKind::Other, e)
+                })?;
+                self.restart_osd()?;
+                debug!("Unsetting noout, nodown");
+                osd_unset(handle, "noout", false).map_err(|e| {
+                    Error::new(ErrorKind::Other, e)
+                })?;
+                osd_unset(handle, "nodown", false).map_err(|e| {
+                    Error::new(ErrorKind::Other, e)
+                })?;
+            }
+            &CephType::Rgw => {
+                debug!("Performing possible release specific rgw changes");
+                self.release_specific(
+                    &from_release,
+                    &to_release,
+                    &CephType::Rgw,
+                )?;
+                debug!("Restarting rgw");
+                self.restart_rgw()?;
+            }
+        };
         Ok(())
     }
 
@@ -837,29 +889,30 @@ fn find_socket(c: &CephType) -> IOResult<PathBuf> {
     for entry in p.read_dir()? {
         if let Ok(entry) = entry {
             trace!("dir entry: {:?}", entry);
+            let file_str = entry.file_name().to_string_lossy().into_owned();
             match c {
                 &CephType::Mon => {
-                    if entry.file_name().to_string_lossy().starts_with("ceph-mon") {
+                    if file_str.starts_with("ceph-mon") && file_str.ends_with("asok") {
                         return Ok(entry.path());
                     }
                 }
                 &CephType::Osd => {
-                    if entry.file_name().to_string_lossy().starts_with("ceph-osd") {
+                    if file_str.starts_with("ceph-osd") && file_str.ends_with("asok") {
                         return Ok(entry.path());
                     }
                 }
                 &CephType::Mds => {
-                    if entry.file_name().to_string_lossy().starts_with("ceph-mds") {
+                    if file_str.starts_with("ceph-mds") && file_str.ends_with("asok") {
                         return Ok(entry.path());
                     }
                 }
                 &CephType::Rgw => {
-                    if entry.file_name().to_string_lossy().starts_with("ceph-rgw") {
+                    if file_str.starts_with("ceph-rgw") && file_str.ends_with("asok") {
                         return Ok(entry.path());
                     }
                 }
                 &CephType::Mgr => {
-                    if entry.file_name().to_string_lossy().starts_with("ceph-mgr") {
+                    if file_str.starts_with("ceph-mgr") && file_str.ends_with("asok") {
                         return Ok(entry.path());
                     }
                 }

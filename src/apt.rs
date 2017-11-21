@@ -12,6 +12,16 @@ use super::debian::version::Version;
 
 // Add a ppa source to apt
 pub fn add_source(source_string: &str) -> IOResult<()> {
+    let sources = {
+        let mut f = File::open("/etc/apt/sources.list")?;
+        let mut buff = String::new();
+        f.read_to_string(&mut buff)?;
+        buff
+    };
+    if sources.contains(source_string) {
+        debug!("sources.list already contains {}. Skipping", source_string);
+        return Ok(());
+    }
     let mut cmd = Command::new("add-apt-repository");
     cmd.arg("-y");
     cmd.arg(source_string);
