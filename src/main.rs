@@ -183,6 +183,13 @@ fn listen(
     }
 }
 
+pub fn get_hostname() -> IOResult<String> {
+    let mut f = File::open("/etc/hostname")?;
+    let mut buff = String::new();
+    f.read_to_string(&mut buff)?;
+    Ok(buff.trim().to_string())
+}
+
 fn notify_slack(
     webhook: &str,
     channel: &str,
@@ -666,12 +673,7 @@ fn upgrade_request(
 }
 
 fn owned_hostname(s: &str) -> Result<bool, String> {
-    let my_hostname = {
-        let mut buff = String::new();
-        let mut f = File::open("/etc/hostname").map_err(|e| e.to_string())?;
-        f.read_to_string(&mut buff).map_err(|e| e.to_string())?;
-        buff.trim().to_string()
-    };
+    let my_hostname = get_hostname().map_err(|e| e.to_string())?;
     if my_hostname == s || my_hostname.contains(s) {
         Ok(true)
     } else {

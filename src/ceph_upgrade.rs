@@ -1,6 +1,7 @@
 extern crate api;
 extern crate ceph_rust;
 extern crate chrono;
+extern crate dns_lookup;
 extern crate init_daemon;
 extern crate nix;
 extern crate rand;
@@ -11,18 +12,24 @@ extern crate users;
 extern crate uuid;
 extern crate walkdir;
 
+use std::error::Error as StdError;
 use std::fmt;
-use std::fs::{copy, File, read_dir, remove_file};
-use std::io::{Error, ErrorKind, Read, Write};
+use std::fs::{copy, create_dir, File, read_dir, remove_file};
+use std::net::IpAddr;
+use std::io::{Error, ErrorKind, Write};
 use std::io::Result as IOResult;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::SystemTime;
+use std::thread;
+use std::time::Duration;
 
 use self::api::service::Version as ApiVersion;
 use self::api::service::CephComponent;
 use self::ceph_rust::ceph::{connect_to_ceph, ceph_version, disconnect_from_ceph};
-use self::ceph_rust::cmd::{mon_dump, osd_unset, osd_set, osd_tree};
+use self::ceph_rust::rados::rados_t;
+use self::ceph_rust::cmd::{auth_get_key, mgr_auth_add, mon_dump, osd_unset, osd_set, osd_tree};
+use self::dns_lookup::lookup_host;
 use self::init_daemon::{detect_daemon, Daemon};
 use self::nix::unistd::{chown, Gid, Uid};
 use self::semver::Version as SemVer;
@@ -342,17 +349,41 @@ pub fn roll_cluster(
         apt_source,
     )?;
     // TODO: How can I do the final checks here??
-    for host in hosts {
+    let mut finished_hosts: Vec<String> = Vec::new();
+    'hosts: for host in hosts {
+        let ips: Vec<IpAddr> = lookup_host(&host.0.addr).map_err(|e| e.to_string())?;
+        for ip in ips {
+            match ip {
+                IpAddr::V4(v4_addr) => {
+                    if finished_hosts.contains(&v4_addr.to_string()) {
+                        info!("Already requested stop from {}.  Skipping", v4_addr);
+                        continue 'hosts;
+                    }
+                }
+                IpAddr::V6(v6_addr) => {
+                    if finished_hosts.contains(&v6_addr.to_string()) {
+                        info!("Already requested stop from {}.  Skipping", v6_addr);
+                        continue 'hosts;
+                    }
+                }
+            }
+        }
+
+        // Check if this is myself
+        let owned_ip = match super::owned_ip(&host.0.addr) {
+            Ok(result) => result,
+            Err(_) => super::owned_hostname(&host.0.addr).unwrap_or(false),
+        };
+        if owned_ip {
+            // Skip myself
+            continue;
+        }
+        debug!("Requesting {} STOP", host.0.addr);
         let mut req_socket = super::connect(&host.0.addr, port).map_err(
             |e| e.to_string(),
         )?;
         let _ = super::stop_request(&mut req_socket);
-        debug!("Stop requested");
-        let ep = req_socket
-            .get_last_endpoint()
-            .map_err(|e| e.to_string())?
-            .unwrap();
-        req_socket.disconnect(&ep).map_err(|e| e.to_string())?;
+        finished_hosts.push(host.0.addr.clone());
     }
     return Ok(());
 }
@@ -451,27 +482,52 @@ impl CephNode {
             let backed_files = backup_conf_files()?;
             debug!("Backed up conf files: {:?}", backed_files);
 
-            apt::apt_remove(vec![
-                "ceph",
-                "ceph-base",
-                "ceph-common",
-                "ceph-mds",
-                "ceph-mon",
-                "ceph-osd",
-                "libcephfs1",
-                "python-cephfs",
-                "python-rados",
-                "python-rbd",
-                "radosgw",
-                "librgw2",
-                "librbd1",
-                "libradosstriper1",
-                "librados2",
-            ]).map_err(|e| Error::new(ErrorKind::Other, e))?;
+            // Try to do these commands for up to a minute and then fail
+            for _ in 0..12 {
+                match apt::apt_remove(vec![
+                    "ceph",
+                    "ceph-base",
+                    "ceph-common",
+                    "ceph-mds",
+                    "ceph-mon",
+                    "ceph-osd",
+                    "libcephfs1",
+                    "python-cephfs",
+                    "python-rados",
+                    "python-rbd",
+                    "radosgw",
+                    "librgw2",
+                    "librbd1",
+                    "libradosstriper1",
+                    "librados2",
+                ]) {
+                    Ok(_) => {
+                        debug!("apt-remove finished");
+                    }
+                    Err(e) => {
+                        if e.description().contains("Could not get lock") {
+                            continue;
+                        } else {
+                            return Err(e);
+                        }
+                    }
+                };
+                thread::sleep(Duration::from_secs(5));
 
-            apt::apt_install(vec!["ceph"]).map_err(|e| {
-                Error::new(ErrorKind::Other, e)
-            })?;
+                match apt::apt_install(vec!["ceph"]) {
+                    Ok(_) => {
+                        debug!("apt-install finished");
+                        break;
+                    }
+                    Err(e) => {
+                        if e.description().contains("Could not get lock") {
+                            continue;
+                        } else {
+                            return Err(e);
+                        }
+                    }
+                };
+            }
             restore_conf_files(&backed_files)?;
             self.finish_upgrade(c, from_release)?;
             return Ok(());
@@ -512,6 +568,7 @@ impl CephNode {
                     &from_release,
                     &to_release,
                     &CephType::Mds,
+                    handle,
                 )?;
                 self.restart_mds()?;
             }
@@ -521,6 +578,7 @@ impl CephNode {
                     &from_release,
                     &to_release,
                     &CephType::Mon,
+                    handle,
                 )?;
                 self.restart_mon()?;
             }
@@ -530,6 +588,7 @@ impl CephNode {
                     &from_release,
                     &to_release,
                     &CephType::Osd,
+                    handle,
                 )?;
                 debug!("Setting noout, nodown to prevent cluster rebuilding");
                 osd_set(handle, "noout", false, false).map_err(|e| {
@@ -553,6 +612,7 @@ impl CephNode {
                     &from_release,
                     &to_release,
                     &CephType::Rgw,
+                    handle,
                 )?;
                 self.restart_rgw()?;
             }
@@ -572,20 +632,21 @@ impl CephNode {
                     CephType::Rgw => c.arg("ceph-rgw.target"),
                     _ => c.arg("ceph-mon.target"),
                 };
+                debug!("systemctl cmd: {:?}", c);
                 let output = c.output()?;
                 if !output.status.success() {
                     return Err(Error::last_os_error());
                 }
             }
             _ => {
-                let mut c = Command::new("systemctl");
-                c.arg("restart");
+                let mut c = Command::new("restart");
                 match ceph_type {
                     CephType::Mon => c.arg("ceph-mon-all"),
                     CephType::Mds => c.arg("ceph-mds-all"),
                     CephType::Rgw => c.arg("ceph-rgw-all"),
                     _ => c.arg("ceph-mon-all"),
                 };
+                debug!("restart cmd: {:?}", c);
                 let output = c.output()?;
                 if !output.status.success() {
                     return Err(Error::last_os_error());
@@ -615,13 +676,7 @@ impl CephNode {
 
     fn restart_osd(&self) -> IOResult<()> {
         // ask ceph for all the osds that this host owns.
-        let hostname = {
-            let mut f = File::open("/etc/hostname")?;
-            let mut buff = String::new();
-            f.read_to_string(&mut buff)?;
-            // /etc/hostname seems to have a trailing \n
-            buff.trim().to_string()
-        };
+        let hostname = super::get_hostname()?;
         let h = connect_to_ceph("admin", "/etc/ceph/ceph.conf").map_err(
             |e| {
                 Error::new(ErrorKind::Other, e)
@@ -763,6 +818,51 @@ impl CephNode {
 
         Ok(())
     }
+
+    ///Starts the specified mgr.
+    fn start_mgr(&self, id: &str) -> IOResult<()> {
+        debug!("Starting mgr: {}", id);
+        let init_daemon = detect_daemon().map_err(|e| Error::new(ErrorKind::Other, e))?;
+        match init_daemon {
+            Daemon::Systemd => {
+                Command::new("systemctl")
+                    .args(&["start", &format!("ceph-mgr@{}", id)])
+                    .status()?;
+            }
+            _ => {
+                return Err(Error::new(
+                    ErrorKind::Other,
+                    "Ceph Mgr only works with systemd.  Cannot start mgr",
+                ));
+            }
+        };
+        Ok(())
+    }
+
+    ///Enables the specified mgr.
+    fn enable_mgr(&self, id: &str) -> IOResult<()> {
+        debug!("Enabling mgr: {}", id);
+        let init_daemon = detect_daemon().map_err(|e| Error::new(ErrorKind::Other, e))?;
+        match init_daemon {
+            Daemon::Systemd => {
+                let output = Command::new("systemctl")
+                    .args(&["enable", &format!("ceph-mgr@{}", id)])
+                    .output()?;
+                trace!("enable: {:?}", output);
+                if !output.status.success() {
+                    return Err(Error::last_os_error());
+                }
+            }
+            _ => {
+                return Err(Error::new(
+                    ErrorKind::Other,
+                    "Ceph Mgr only works with systemd.  Cannot enable mgr",
+                ));
+            }
+        };
+        Ok(())
+    }
+
     ///Enables the specified OSD number.
     ///Ensures that the specified osd_num will be enabled and ready to start
     ///automatically in the event of a reboot.
@@ -833,6 +933,7 @@ impl CephNode {
         from: &CephVersion,
         to: &CephVersion,
         ceph_type: &CephType,
+        handle: rados_t,
     ) -> IOResult<()> {
         if from == &CephVersion::Hammer && to == &CephVersion::Jewel {
             debug!("Hammer -> Jewel specific");
@@ -866,6 +967,20 @@ impl CephNode {
                 &CephType::Mgr => {}
                 &CephType::Mon => {
                     // ceph osd set sortbitwise
+
+                    // Startup a mgr on every mon
+                    let hostname = super::get_hostname()?;
+                    mgr_auth_add(handle, &hostname, false).map_err(|e| {
+                        Error::new(ErrorKind::Other, e)
+                    })?;
+                    debug!("Getting mgr keyring");
+                    let mgr_key = auth_get_key(handle, "mgr", &hostname).map_err(|e| {
+                        Error::new(ErrorKind::Other, e)
+                    })?;
+                    create_dir(format!("/var/lib/ceph/mgr/ceph-{}", hostname))?;
+                    save_keyring("mgr", &hostname, &mgr_key)?;
+                    self.enable_mgr(&hostname)?;
+                    self.start_mgr(&hostname)?;
                 }
                 &CephType::Osd => {}
                 &CephType::Rgw => {}
@@ -935,7 +1050,6 @@ pub fn get_running_version(c: &CephType) -> IOResult<SemVer> {
 fn ceph_release() -> IOResult<CephVersion> {
     debug!("Getting ceph release");
     let v = apt::get_installed_package_version("ceph").map_err(|e| {
-        error!("get_installed_package_version failed: {:?}", e);
         Error::new(ErrorKind::Other, e)
     })?;
     debug!("apt installed version: {}", v);
@@ -975,6 +1089,24 @@ fn ceph_user(c: &CephVersion) -> String {
         //TODO what should we return here?.  I can't figure out what the ceph version is
         &CephVersion::Unknown => "root".into(),
     }
+}
+
+// Save a keyring
+fn save_keyring(client: &str, id: &str, key: &str) -> IOResult<()> {
+    let base_dir = format!("/var/lib/ceph/{}/ceph-{}", client, id);
+    if !Path::new(&base_dir).exists() {
+        return Err(Error::new(
+            ErrorKind::NotFound,
+            format!("{} directory doesn't exist", base_dir),
+        ));
+    }
+    debug!("Creating {}/keyring", base_dir);
+    let mut f = File::create(format!("{}/keyring", base_dir))?;
+    f.write_all(
+        format!("[{}.{}]\n\tkey = {}\n", client, id, key)
+            .as_bytes(),
+    )?;
+    Ok(())
 }
 
 ///Changes the ownership of the specified path.
