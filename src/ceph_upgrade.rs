@@ -382,9 +382,6 @@ impl CephNode {
         let from_release = ceph_release().map_err(|e| e.to_string())?;
         debug!("from_release: {}", from_release);
 
-        let backed_files = backup_conf_files().map_err(|e| e.to_string())?;
-        debug!("Backed up conf files: {:?}", backed_files);
-
         if let Some(gpg_key) = gpg_key {
             debug!("Adding gpg key: {}", gpg_key);
             apt::get_gpg_key(gpg_key).map_err(|e| e.to_string())?;
@@ -516,7 +513,6 @@ impl CephNode {
                     &to_release,
                     &CephType::Mds,
                 )?;
-                debug!("Restarting mds");
                 self.restart_mds()?;
             }
             &CephType::Mon => {
@@ -526,7 +522,6 @@ impl CephNode {
                     &to_release,
                     &CephType::Mon,
                 )?;
-                debug!("Restarting mon");
                 self.restart_mon()?;
             }
             &CephType::Osd => {
@@ -536,7 +531,6 @@ impl CephNode {
                     &to_release,
                     &CephType::Osd,
                 )?;
-                debug!("Restarting osd");
                 debug!("Setting noout, nodown to prevent cluster rebuilding");
                 osd_set(handle, "noout", false, false).map_err(|e| {
                     Error::new(ErrorKind::Other, e)
@@ -560,7 +554,6 @@ impl CephNode {
                     &to_release,
                     &CephType::Rgw,
                 )?;
-                debug!("Restarting rgw");
                 self.restart_rgw()?;
             }
         };
@@ -933,11 +926,9 @@ pub fn get_running_version(c: &CephType) -> IOResult<SemVer> {
             return Err(Error::new(ErrorKind::Other, "Unable to find ceph version"));
         }
     };
-    debug!("ceph version from socket: {}", v);
     let ceph_version = SemVer::parse(&v).map_err(
         |e| Error::new(ErrorKind::Other, e),
     )?;
-    debug!("ceph version from semver: {}", ceph_version);
     Ok(ceph_version)
 }
 

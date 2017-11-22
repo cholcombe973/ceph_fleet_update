@@ -61,6 +61,7 @@ pub fn apt_install(packages: Vec<&str>) -> IOResult<()> {
     for package in packages {
         cmd.arg(package);
     }
+    debug!("apt install cmd: {:?}", cmd);
     let output = cmd.output()?;
     if !output.status.success() {
         return Err(Error::new(
