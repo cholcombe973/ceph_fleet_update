@@ -89,6 +89,7 @@ fn listen(
                     https_proxy,
                     gpg_key,
                     apt_source,
+                    operation.get_force_remove(),
                 )
                 {
                     error!("BecomeLeader error: {:?}", e);
@@ -168,6 +169,7 @@ fn listen(
                     https_proxy,
                     gpg_key,
                     apt_source,
+                    operation.get_force_remove(),
                 )
                 {
                     error!("Upgrade error: {:?}", e);
@@ -284,6 +286,7 @@ fn handle_become_leader(
     https_proxy: Option<&str>,
     gpg_key: Option<&str>,
     apt_source: Option<&str>,
+    force_remove: bool,
 ) -> IOResult<()> {
     let mut result = OpResult::new();
     result.set_result(ResultType::OK);
@@ -315,6 +318,7 @@ fn handle_become_leader(
         https_proxy,
         gpg_key,
         apt_source,
+        force_remove,
     ) {
         Ok(_) => {
             info!("Cluster rolling upgrade completed");
@@ -416,6 +420,7 @@ fn handle_upgrade(
     https_proxy: Option<&str>,
     gpg_key: Option<&str>,
     apt_source: Option<&str>,
+    force_remove: bool,
 ) -> IOResult<()> {
     // Upgrade to a new release
     let mut result = OpResult::new();
@@ -427,6 +432,7 @@ fn handle_upgrade(
         https_proxy,
         gpg_key,
         apt_source,
+        force_remove,
     ) {
         Ok(_) => {
             debug!("Upgrading went OK");
@@ -461,10 +467,11 @@ fn connect(host: &str, port: u16) -> ZmqResult<Socket> {
     Ok(requester)
 }
 
-fn become_leader_request(s: &mut Socket) -> Result<(), String> {
+fn become_leader_request(s: &mut Socket, force_remove: bool) -> Result<(), String> {
     let mut o = Operation::new();
     debug!("Creating become_leader operation request");
     o.set_Op_type(Op::BecomeLeader);
+    o.set_force_remove(force_remove);
 
     let encoded = o.write_to_bytes().unwrap();
     let msg = Message::from_slice(&encoded).map_err(|e| e.to_string())?;
@@ -623,12 +630,14 @@ fn upgrade_request(
     https_proxy: Option<&str>,
     gpg_key: Option<&str>,
     apt_source: Option<&str>,
+    force_remove: bool,
 ) -> Result<(), String> {
     let mut o = Operation::new();
     debug!("Creating upgrade operation request");
     o.set_Op_type(Op::Upgrade);
     o.set_version(version);
     o.set_service(CephComponent::from(ceph_type.clone()));
+    o.set_force_remove(force_remove);
     // Set proxies if needed
     if let Some(http_proxy) = http_proxy {
         o.set_http_proxy(http_proxy.into());
@@ -965,6 +974,13 @@ fn main() {
                 .required(true),
         )
         .arg(
+            Arg::with_name("force_remove")
+                .help("Remove all ceph packages before doing a reinstall")
+                .long("forceremove")
+                .takes_value(false)
+                .required(false),
+        )
+        .arg(
             Arg::with_name("repo_source")
                 .help("Apt source for new repository if needed")
                 .long("reposource")
@@ -1012,6 +1028,7 @@ fn main() {
     let _ = SimpleLogger::init(level, Config::default()).unwrap();
     info!("Skynet starting up");
     let host = matches.value_of("host");
+    let force_remove = matches.is_present("force_remove");
     let http_proxy = matches.value_of("http_proxy");
     let https_proxy = matches.value_of("https_proxy");
     let gpg_key = matches.value_of("repo_key");
@@ -1039,7 +1056,7 @@ fn main() {
             apt_source,
         )
         {
-            match become_leader_request(&mut s) {
+            match become_leader_request(&mut s, force_remove) {
                 Ok(_) => {
                     info!("become leader request successful");
                 }

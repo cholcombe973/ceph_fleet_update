@@ -85,4 +85,6 @@ message Operation {
   optional string gpg_key = 6;
   // apt source line to use
   optional string apt_source = 7;
+  // Force remove ceph packages before reinstalling
+  optional bool force_remove = 8;
 }

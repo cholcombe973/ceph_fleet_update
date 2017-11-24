@@ -221,6 +221,7 @@ fn connect_and_upgrade(
     https_proxy: Option<&str>,
     gpg_key: Option<&str>,
     apt_source: Option<&str>,
+    force_remove: bool,
 ) -> Result<(), String> {
     for s in servers {
         // First check if I own this ip address. If so then skip the RPC request
@@ -239,6 +240,7 @@ fn connect_and_upgrade(
                 https_proxy,
                 gpg_key,
                 apt_source,
+                force_remove,
             ) {
                 Ok(_) => {
                     info!("Upgrade succeeded.  Proceeding to next");
@@ -261,6 +263,7 @@ fn connect_and_upgrade(
                 https_proxy,
                 gpg_key,
                 apt_source,
+                force_remove,
             ) {
                 Ok(_) => {
                     info!("Upgrade succeeded.  Proceeding to next");
@@ -285,6 +288,7 @@ pub fn roll_cluster(
     https_proxy: Option<&str>,
     gpg_key: Option<&str>,
     apt_source: Option<&str>,
+    force_remove: bool,
 ) -> Result<(), String> {
     // Inspect the cluster health to make sure the mon upgrades were successful
     // Inspect the cluster health to make sure the osd upgrades were successful
@@ -317,6 +321,7 @@ pub fn roll_cluster(
         https_proxy,
         gpg_key,
         apt_source,
+        force_remove,
     )?;
     connect_and_upgrade(
         osds,
@@ -327,6 +332,7 @@ pub fn roll_cluster(
         https_proxy,
         gpg_key,
         apt_source,
+        force_remove,
     )?;
     connect_and_upgrade(
         mds,
@@ -337,6 +343,7 @@ pub fn roll_cluster(
         https_proxy,
         gpg_key,
         apt_source,
+        force_remove,
     )?;
     connect_and_upgrade(
         rgws,
@@ -347,6 +354,7 @@ pub fn roll_cluster(
         https_proxy,
         gpg_key,
         apt_source,
+        force_remove,
     )?;
     // TODO: How can I do the final checks here??
     let mut finished_hosts: Vec<String> = Vec::new();
@@ -404,6 +412,7 @@ impl CephNode {
         https_proxy: Option<&str>,
         gpg_key: Option<&str>,
         apt_source: Option<&str>,
+        force_remove: bool,
     ) -> Result<(), String> {
         debug!(
             "Upgrading from {:?} to {:?}",
@@ -434,16 +443,18 @@ impl CephNode {
         // Update our repo information
         apt::apt_update().map_err(|e| e.to_string())?;
         // Upgrade the node
-        self.upgrade(&CephType::from(c), &from_release).map_err(
-            |e| {
-                e.to_string()
-            },
-        )?;
+        self.upgrade(&CephType::from(c), &from_release, force_remove)
+            .map_err(|e| e.to_string())?;
         return Ok(());
     }
 
     //basic upgrade things that all nodes need to do
-    fn upgrade(&self, c: &CephType, from_release: &CephVersion) -> IOResult<()> {
+    fn upgrade(
+        &self,
+        c: &CephType,
+        from_release: &CephVersion,
+        force_remove: bool,
+    ) -> IOResult<()> {
         info!("Beginning upgrade procedure");
         /*
             3 cases:
@@ -477,42 +488,44 @@ impl CephNode {
             debug!("candidate_version > installed_version && installed_version == running_version");
             //apt install + restart service
 
-            // TODO: Put this behind a feature flag.  This is probably overkill
-            // except on broken systems.
             let backed_files = backup_conf_files()?;
             debug!("Backed up conf files: {:?}", backed_files);
 
             // Try to do these commands for up to a minute and then fail
             for _ in 0..12 {
-                match apt::apt_remove(vec![
-                    "ceph",
-                    "ceph-base",
-                    "ceph-common",
-                    "ceph-mds",
-                    "ceph-mon",
-                    "ceph-osd",
-                    "libcephfs1",
-                    "python-cephfs",
-                    "python-rados",
-                    "python-rbd",
-                    "radosgw",
-                    "librgw2",
-                    "librbd1",
-                    "libradosstriper1",
-                    "librados2",
-                ]) {
-                    Ok(_) => {
-                        debug!("apt-remove finished");
-                    }
-                    Err(e) => {
-                        if e.description().contains("Could not get lock") {
-                            continue;
-                        } else {
-                            return Err(e);
+                if force_remove {
+                    //TODO This list of packages should be parsed from a file.  It changes
+                    //TODO depending on the ceph version and operating system
+                    match apt::apt_remove(vec![
+                        "ceph",
+                        "ceph-base",
+                        "ceph-common",
+                        "ceph-mds",
+                        "ceph-mon",
+                        "ceph-osd",
+                        "libcephfs1",
+                        "python-cephfs",
+                        "python-rados",
+                        "python-rbd",
+                        "radosgw",
+                        "librgw2",
+                        "librbd1",
+                        "libradosstriper1",
+                        "librados2",
+                    ]) {
+                        Ok(_) => {
+                            debug!("apt-remove finished");
                         }
-                    }
-                };
-                thread::sleep(Duration::from_secs(5));
+                        Err(e) => {
+                            if e.description().contains("Could not get lock") {
+                                continue;
+                            } else {
+                                return Err(e);
+                            }
+                        }
+                    };
+                    thread::sleep(Duration::from_secs(5));
+                }
 
                 match apt::apt_install(vec!["ceph"]) {
                     Ok(_) => {
