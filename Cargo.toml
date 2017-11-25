@@ -7,7 +7,7 @@ license = "MIT"
 [dependencies]
 api = { path = "api" }
 apt-pkg-native = "*"
-ceph-rust = {git = "https://github.com/cholcombe973/ceph-rust" } #"~0.1"
+ceph = {git = "https://github.com/cholcombe973/ceph-rust" } #"~0.1"
 clap = "*"
 chrono = { version = "~0.4", features = ["rustc-serialize"] }
 debian = {git = "https://github.com/mwanner/rust-debian" }
@@ -22,6 +22,7 @@ protobuf = "*"
 rand = "~0.3"
 regex = "*"
 reqwest = "~0.8"
+rust-ini = "*"
 semver = "*"
 simplelog = "*"
 slack-hook = "*"

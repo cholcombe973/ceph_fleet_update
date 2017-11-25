@@ -1,7 +1,8 @@
 extern crate api;
-extern crate ceph_rust;
+extern crate ceph;
 extern crate chrono;
 extern crate dns_lookup;
+extern crate ini;
 extern crate init_daemon;
 extern crate nix;
 extern crate rand;
@@ -26,10 +27,12 @@ use std::time::Duration;
 
 use self::api::service::Version as ApiVersion;
 use self::api::service::CephComponent;
-use self::ceph_rust::ceph::{connect_to_ceph, ceph_version, disconnect_from_ceph};
-use self::ceph_rust::rados::rados_t;
-use self::ceph_rust::cmd::{auth_get_key, mgr_auth_add, mon_dump, osd_unset, osd_set, osd_tree};
+use self::ceph::ceph::{connect_to_ceph, ceph_version, disconnect_from_ceph};
+use self::ceph::rados::rados_t;
+use self::ceph::cmd::{auth_get_key, mgr_auth_add, mgr_dump, mon_dump, mon_status, OsdOption,
+                      osd_unset, osd_set, osd_tree};
 use self::dns_lookup::lookup_host;
+use self::ini::Ini;
 use self::init_daemon::{detect_daemon, Daemon};
 use self::nix::unistd::{chown, Gid, Uid};
 use self::semver::Version as SemVer;
@@ -604,18 +607,22 @@ impl CephNode {
                     handle,
                 )?;
                 debug!("Setting noout, nodown to prevent cluster rebuilding");
-                osd_set(handle, "noout", false, false).map_err(|e| {
-                    Error::new(ErrorKind::Other, e)
-                })?;
-                osd_set(handle, "nodown", false, false).map_err(|e| {
-                    Error::new(ErrorKind::Other, e)
-                })?;
+                osd_set(handle, &OsdOption::NoOut, false, false).map_err(
+                    |e| {
+                        Error::new(ErrorKind::Other, e)
+                    },
+                )?;
+                osd_set(handle, &OsdOption::NoDown, false, false).map_err(
+                    |e| {
+                        Error::new(ErrorKind::Other, e)
+                    },
+                )?;
                 self.restart_osd()?;
                 debug!("Unsetting noout, nodown");
-                osd_unset(handle, "noout", false).map_err(|e| {
+                osd_unset(handle, &OsdOption::NoOut, false).map_err(|e| {
                     Error::new(ErrorKind::Other, e)
                 })?;
-                osd_unset(handle, "nodown", false).map_err(|e| {
+                osd_unset(handle, &OsdOption::NoDown, false).map_err(|e| {
                     Error::new(ErrorKind::Other, e)
                 })?;
             }
@@ -695,12 +702,12 @@ impl CephNode {
                 Error::new(ErrorKind::Other, e)
             },
         )?;
-        let osd_tree = ceph_rust::cmd::osd_tree(h).map_err(|e| {
-            Error::new(ErrorKind::Other, e)
-        })?;
+        let osd_tree = ceph::cmd::osd_tree(h).map_err(
+            |e| Error::new(ErrorKind::Other, e),
+        )?;
         debug!("osd_tree: {:?}", osd_tree);
         // This should filter down to 1 node
-        let hosts: Vec<&ceph_rust::cmd::CrushNode> = osd_tree
+        let hosts: Vec<&ceph::cmd::CrushNode> = osd_tree
             .nodes
             .iter()
             .filter(|n| n.crush_type == "host" && n.name == hostname)
@@ -955,9 +962,21 @@ impl CephNode {
             match ceph_type {
                 &CephType::Mds => {}
                 &CephType::Mgr => {}
-                &CephType::Mon => {}
+                &CephType::Mon => {
+                    config_set(
+                        Path::new("/etc/ceph/ceph.conf"),
+                        "global",
+                        "setuser match path",
+                        "/var/lib/ceph/$type/$cluster-$id",
+                    )?;
+                }
                 &CephType::Osd => {
-                    //setuser match path = /var/lib/ceph/$type/$cluster-$id
+                    config_set(
+                        Path::new("/etc/ceph/ceph.conf"),
+                        "global",
+                        "setuser match path",
+                        "/var/lib/ceph/$type/$cluster-$id",
+                    )?;
                     debug!("Checking if osd owner needs updating");
                     //update_owner(
                     //   &Path::new(&format!("/var/lib/ceph/osd/ceph-{}", child)),
@@ -1000,6 +1019,36 @@ impl CephNode {
             }
         }
         Ok(())
+    }
+
+    // Check with Ceph to see if the client has returned to healthy in the
+    // cluster
+    fn is_healthy(&self, handle: rados_t, c: &CephType, id: &str) -> IOResult<bool> {
+        match c {
+            &CephType::Mds => Ok(true),
+            &CephType::Mgr => {
+                // check for available
+                let mgrs = mgr_dump(handle).map_err(
+                    |e| Error::new(ErrorKind::Other, e),
+                )?;
+                Ok(true)
+            }
+            &CephType::Mon => {
+                // run mon_status.  What do I check for?
+                let status = mon_status(handle).map_err(
+                    |e| Error::new(ErrorKind::Other, e),
+                )?;
+                Ok(true)
+            }
+            &CephType::Osd => {
+                // run osd_tree and check for up/in?
+                let tree = osd_tree(handle).map_err(
+                    |e| Error::new(ErrorKind::Other, e),
+                )?;
+                Ok(true)
+            }
+            &CephType::Rgw => Ok(true),
+        }
     }
 }
 
@@ -1058,6 +1107,15 @@ pub fn get_running_version(c: &CephType) -> IOResult<SemVer> {
         |e| Error::new(ErrorKind::Other, e),
     )?;
     Ok(ceph_version)
+}
+
+fn config_set(p: &Path, section: &str, key: &str, value: &str) -> IOResult<()> {
+    let mut conf = Ini::load_from_file(p).map_err(
+        |e| Error::new(ErrorKind::Other, e),
+    )?;
+    conf.with_section(Some(section.to_string())).set(key, value);
+    conf.write_to_file(p)?;
+    Ok(())
 }
 
 fn ceph_release() -> IOResult<CephVersion> {
