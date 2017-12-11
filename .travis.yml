@@ -1,0 +1,27 @@
+sudo: false
+dist: trusty
+
+language: rust
+
+cache:
+  cargo: true
+  apt: true
+
+rust:
+  - stable
+  - beta
+  - nightly
+
+matrix:
+  allow_failures:
+    - rust: nightly
+
+addons:
+  apt:
+    sources:
+    packages:
+      - libapt-pkg-dev
+      - librados-dev
+
+script:
+  - cargo test --all --verbose
