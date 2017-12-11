@@ -1,27 +1,18 @@
-sudo: false
+sudo: required
 dist: trusty
 
 language: rust
 
-cache:
-  cargo: true
-  apt: true
-
 rust:
   - stable
   - beta
-  - nightly
 
-matrix:
-  allow_failures:
-    - rust: nightly
-
-addons:
-  apt:
-    sources:
-    packages:
-      - libapt-pkg-dev
-      - librados-dev
+before_install:
+   - sudo echo "deb http://download.opensuse.org/repositories/network:/messaging:/zeromq:/release-stable/xUbuntu_14.04" >> /etc/apt/sources.list
+   - wget https://download.opensuse.org/repositories/network:/messaging:/zeromq:/release-stable/xUbuntu_14.04/Release.key -O- | sudo apt-key add
+   - sudo apt-get -qq update
+   - apt-get -y install clang libapt-pkg-dev libprotobuf-dev librados-dev libssl-dev libzmq3-dev libzmq5 pkg-config protobuf-compiler
 
 script:
+  - cargo build --all --verbose
   - cargo test --all --verbose
