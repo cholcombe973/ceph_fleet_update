@@ -29,9 +29,9 @@ use std::thread;
 use std::time;
 use std::time::Duration;
 
-use api::service::{CephComponent, CephServer, HostResult, Op, Operation, ResultType, OpResult,
-                   Version, VersionElement, VersionPart, VersionResult};
-use ceph_upgrade::{get_running_version, CephType, CephNode};
+use api::service::{CephComponent, CephRelease, CephServer, HostResult, Op, Operation, OpResult,
+                   ReleaseResult, ResultType, Version, VersionElement, VersionPart, VersionResult};
+use ceph_upgrade::{get_running_version, CephType, CephNode, CephVersion, final_checks};
 use clap::{Arg, App};
 use debian::version::Version as DebianVersion;
 use dns_lookup::lookup_host;
@@ -180,6 +180,23 @@ fn listen(
                 info!("Exit called");
                 return Ok(());
             }
+
+            Op::Validate => {
+                if !operation.has_from_release() || !operation.has_to_release() {
+                    error!(
+                        "validate requires that from_release and to_release fields be
+                        filled in. Skipping request"
+                    );
+                }
+                if let Err(e) = handle_validate(
+                    &mut responder,
+                    operation.get_from_release(),
+                    operation.get_to_release(),
+                )
+                {
+                    error!("Validate error: {:?}", e);
+                }
+            }
         };
         thread::sleep(Duration::from_millis(10));
     }
@@ -276,6 +293,36 @@ pub fn version_to_protobuf(v: &DebianVersion) -> Version {
     version_msg.set_debian_revision(debian);
 
     version_msg
+}
+
+fn handle_validate(
+    s: &mut Socket,
+    from_release: CephRelease,
+    to_release: CephRelease,
+) -> IOResult<()> {
+    let final_result = final_checks(
+        &CephVersion::from(from_release),
+        &CephVersion::from(to_release),
+    );
+
+    let mut result = OpResult::new();
+    match final_result {
+        Ok(_) => {
+            result.set_result(ResultType::OK);
+        }
+        Err(e) => {
+            result.set_result(ResultType::ERR);
+            result.set_error_msg(e.to_string());
+        }
+    };
+    let encoded = result.write_to_bytes().map_err(
+        |e| Error::new(ErrorKind::Other, e),
+    )?;
+    let msg = Message::from_slice(&encoded)?;
+    debug!("Responding to client with msg len: {}", msg.len());
+    s.send_msg(msg, 0)?;
+
+    Ok(())
 }
 
 fn handle_become_leader(

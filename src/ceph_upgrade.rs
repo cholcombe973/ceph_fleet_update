@@ -26,10 +26,10 @@ use std::thread;
 use std::time::Duration;
 
 use self::api::service::Version as ApiVersion;
-use self::api::service::CephComponent;
+use self::api::service::{CephComponent, CephRelease};
 use self::ceph::ceph::{connect_to_ceph, ceph_version, disconnect_from_ceph};
 use self::ceph::rados::rados_t;
-use self::ceph::cmd::{auth_get_key, mgr_auth_add, mgr_dump, mon_dump, mon_status, OsdOption,
+use self::ceph::cmd::{auth_get_key, mgr_auth_add, mgr_dump, Mon, mon_dump, mon_status, OsdOption,
                       osd_unset, osd_set, osd_tree};
 use self::dns_lookup::lookup_host;
 use self::ini::Ini;
@@ -89,7 +89,7 @@ impl From<CephType> for CephComponent {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-enum CephVersion {
+pub enum CephVersion {
     Dumpling,
     Emperor,
     Firefly,
@@ -119,6 +119,22 @@ impl fmt::Display for CephVersion {
     }
 }
 
+impl From<CephRelease> for CephVersion {
+    fn from(c: CephRelease) -> Self {
+        match c {
+            CephRelease::Dumpling => CephVersion::Dumpling,
+            CephRelease::Emperor => CephVersion::Emperor,
+            CephRelease::Firefly => CephVersion::Firefly,
+            CephRelease::Giant => CephVersion::Giant,
+            CephRelease::Hammer => CephVersion::Hammer,
+            CephRelease::Infernalis => CephVersion::Infernalis,
+            CephRelease::Jewel => CephVersion::Jewel,
+            CephRelease::Kraken => CephVersion::Kraken,
+            CephRelease::Luminous => CephVersion::Luminous,
+            CephRelease::Unknown => CephVersion::Unknown,
+        }
+    }
+}
 /// A server.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CephServer {
@@ -236,7 +252,6 @@ fn connect_and_upgrade(
             debug!("Upgrading myself");
             let node = CephNode::new();
             match node.upgrade_node(
-                //ApiVersion::from(new_version),
                 &super::version_to_protobuf(new_version),
                 CephComponent::from(c.clone()),
                 http_proxy,
@@ -1038,7 +1053,29 @@ impl CephNode {
                 let status = mon_status(handle).map_err(
                     |e| Error::new(ErrorKind::Other, e),
                 )?;
-                Ok(true)
+                let mon_rank: Option<&Mon> =
+                    status.monmap.mons.iter().find(|mon| if mon.name == id {
+                        true
+                    } else {
+                        false
+                    });
+                match mon_rank {
+                    Some(ref mon) => {
+                        if status.quorum.contains(&mon.rank) {
+                            // This means the mon is back in quorum
+                            Ok(true)
+                        } else {
+                            // This means the mon either connecting or having a problem
+                            Ok(false)
+                        }
+                    }
+                    None => {
+                        Err(Error::new(
+                            ErrorKind::Other,
+                            format!("Unable to find mon {} in {:?}", id, status),
+                        ))
+                    }
+                }
             }
             &CephType::Osd => {
                 // run osd_tree and check for up/in?
@@ -1179,6 +1216,24 @@ fn save_keyring(client: &str, id: &str, key: &str) -> IOResult<()> {
     )?;
     Ok(())
 }
+
+// Any final things that need to happen that can be set from a ceph monitor
+// This is optional as some of these settings can cause significant data movement
+// or break older clients
+pub fn final_checks(from: &CephVersion, to: &CephVersion) -> IOResult<()> {
+    // Any final things that need to be done
+    if from == &CephVersion::Hammer && to == &CephVersion::Jewel {
+        // Hammer -> Jewel sortbitwise
+        // ceph osd set required_jewel_osds
+        // ceph osd crush tuanbles optimal
+        debug!("Hammer -> Jewel final checks");
+    } else if from == &CephVersion::Jewel && to == &CephVersion::Luminous {
+        // Jewel -> Luminous
+        debug!("Jewel -> Luminous final checks");
+    }
+    Ok(())
+}
+
 
 ///Changes the ownership of the specified path.
 ///Changes the ownership of the specified path to the new ceph daemon user

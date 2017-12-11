@@ -46,6 +46,14 @@ message OpResult {
   optional string error_msg = 2;
 }
 
+// Used to communicate back the ceph release differential
+message ReleaseResult {
+  required ResultType result = 1;
+  required CephRelease from_release = 2;
+  required CephRelease to_release = 3;
+  optional string error_msg = 4;
+}
+
 enum ResultType{
   OK = 0;
   ERR = 1;
@@ -59,6 +67,19 @@ enum CephComponent {
   Mgr = 4;
 }
 
+enum CephRelease {
+  Dumpling = 0;
+  Emperor = 1;
+  Firefly = 2;
+  Giant = 3;
+  Hammer = 4;
+  Infernalis = 5;
+  Jewel = 6;
+  Kraken = 7;
+  Luminous = 8;
+  Unknown = 9;
+}
+
 enum Op {
   // What version are you currently running
   InstalledVersion = 1;
@@ -69,6 +90,11 @@ enum Op {
   ListHosts = 5;
   // Transition to leader and start rolling upgrade
   BecomeLeader = 6;
+  // Final validation steps that may need to be performed
+  // Uses the from_release, to_release Operation fields to inform the
+  // monitor host about the differential and let it do the appropriate
+  // things
+  Validate = 7;
 }
 
 // Service operations that can be performed
@@ -87,4 +113,8 @@ message Operation {
   optional string apt_source = 7;
   // Force remove ceph packages before reinstalling
   optional bool force_remove = 8;
+  // The release we upgraded from
+  optional CephRelease from_release = 9;
+  // The release we upgraded to
+  optional CephRelease to_release = 10;
 }
